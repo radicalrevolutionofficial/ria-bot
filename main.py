@@ -1,7 +1,7 @@
 import os
 import json
 import requests
-from flask import Flask, request, jsonify
+from flask import Flask, request, jsonify, redirect
 from google.oauth2.service_account import Credentials
 import gspread
 from datetime import datetime
@@ -9,8 +9,7 @@ from datetime import datetime
 app = Flask(__name__)
 
 # ============================================
-# CONFIGURATION — all values from environment
-# variables set in Render dashboard
+# CONFIGURATION
 # ============================================
 BOT_TOKEN     = os.environ.get("BOT_TOKEN")
 SHEET_ID      = os.environ.get("SHEET_ID")
@@ -21,14 +20,82 @@ YT_CHANNEL    = os.environ.get("YT_CHANNEL")
 FB_PAGE_TOKEN = os.environ.get("FB_PAGE_TOKEN")
 FB_PAGE_ID    = os.environ.get("FB_PAGE_ID")
 IG_ACCOUNT_ID = os.environ.get("IG_ACCOUNT_ID")
+THREADS_TOKEN = os.environ.get("THREADS_TOKEN")
+THREADS_USER_ID = os.environ.get("THREADS_USER_ID")
+
+APP_ID        = "1619028032581015"
+APP_SECRET    = "9d84a34bc4cbbfaebc7c07ea1d977114"
+REDIRECT_URI  = "https://ria-bot-16zn.onrender.com/threads-callback"
 
 TELEGRAM_API = f"https://api.telegram.org/bot{BOT_TOKEN}"
 
 
 # ============================================
+# THREADS SETUP PAGE
+# Visit this URL to authorize Threads access.
+# ============================================
+@app.route("/threads-setup")
+def threads_setup():
+    auth_url = (
+        f"https://threads.net/oauth/authorize"
+        f"?client_id={APP_ID}"
+        f"&redirect_uri={REDIRECT_URI}"
+        f"&scope=threads_basic"
+        f"&response_type=code"
+    )
+    return redirect(auth_url)
+
+
+# ============================================
+# THREADS CALLBACK
+# Handles the OAuth redirect from Threads.
+# Exchanges code for access token automatically.
+# ============================================
+@app.route("/threads-callback")
+def threads_callback():
+    code = request.args.get("code")
+    if not code:
+        return "Error: No code received", 400
+
+    # Exchange code for short-lived token
+    response = requests.post("https://graph.threads.net/oauth/access_token", data={
+        "client_id": APP_ID,
+        "client_secret": APP_SECRET,
+        "grant_type": "authorization_code",
+        "redirect_uri": REDIRECT_URI,
+        "code": code
+    })
+    data = response.json()
+
+    if "access_token" not in data:
+        return f"Error getting token: {data}", 400
+
+    short_token = data["access_token"]
+    user_id     = data["user_id"]
+
+    # Exchange for long-lived token (60 days)
+    ll_response = requests.get(
+        f"https://graph.threads.net/access_token"
+        f"?grant_type=th_exchange_token"
+        f"&client_secret={APP_SECRET}"
+        f"&access_token={short_token}"
+    )
+    ll_data = ll_response.json()
+    long_token = ll_data.get("access_token", short_token)
+
+    return f"""
+    <h2>✅ Threads Connected!</h2>
+    <p><strong>User ID:</strong> {user_id}</p>
+    <p><strong>Long-lived Token:</strong><br>
+    <textarea rows="4" cols="80">{long_token}</textarea></p>
+    <p>Copy both values and add them to Render environment variables:<br>
+    <strong>THREADS_USER_ID</strong> = {user_id}<br>
+    <strong>THREADS_TOKEN</strong> = (the token above)</p>
+    """
+
+
+# ============================================
 # WEBHOOK ENDPOINT
-# Telegram sends all updates here instantly.
-# Flask responds immediately so Telegram never retries.
 # ============================================
 @app.route("/webhook", methods=["POST"])
 def webhook():
@@ -58,9 +125,6 @@ def webhook():
         send_menu(chat_id)
         return jsonify({"ok": True})
 
-    # -----------------------------------------------
-    # INPUT C2 FLOW
-    # -----------------------------------------------
     lines = text.split("\n")
     if len(lines) < 3:
         return jsonify({"ok": True})
@@ -95,10 +159,12 @@ def handle_callback(callback):
         fb = get_facebook_followers()
         ig = get_instagram_followers()
         yt = get_youtube_subscribers()
+        th = get_threads_followers()
         send_message(chat_id,
             f"📊 Radical Revolution Followers\n\n"
             f"👍 Facebook: {fb}\n"
             f"📸 Instagram: {ig}\n"
+            f"🧵 Threads: {th}\n"
             f"▶️ YouTube: {yt}\n\n"
             f"🎵 TikTok — coming soon!"
         )
@@ -155,7 +221,6 @@ def save_to_sheet(message_id, c2, likes, reached):
 
 # ============================================
 # GET YOUTUBE SUBSCRIBERS
-# Fetches exact count with commas formatting.
 # ============================================
 def get_youtube_subscribers():
     try:
@@ -170,7 +235,6 @@ def get_youtube_subscribers():
 
 # ============================================
 # GET FACEBOOK FOLLOWERS
-# Fetches exact count with commas formatting.
 # ============================================
 def get_facebook_followers():
     try:
@@ -185,8 +249,6 @@ def get_facebook_followers():
 
 # ============================================
 # GET INSTAGRAM FOLLOWERS
-# Fetches exact count using Instagram Business
-# Account ID with commas formatting.
 # ============================================
 def get_instagram_followers():
     try:
@@ -196,6 +258,23 @@ def get_instagram_followers():
         return f"{count:,}"
     except Exception as e:
         print(f"Instagram error: {e}")
+        return "unavailable"
+
+
+# ============================================
+# GET THREADS FOLLOWERS
+# Fetches exact follower count from Threads API.
+# ============================================
+def get_threads_followers():
+    try:
+        if not THREADS_TOKEN or not THREADS_USER_ID:
+            return "not connected yet"
+        url    = f"https://graph.threads.net/v1.0/{THREADS_USER_ID}?fields=followers_count&access_token={THREADS_TOKEN}"
+        result = requests.get(url).json()
+        count  = int(result["followers_count"])
+        return f"{count:,}"
+    except Exception as e:
+        print(f"Threads error: {e}")
         return "unavailable"
 
 
