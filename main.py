@@ -159,7 +159,9 @@ def save_to_sheet(message_id, c2, likes, reached):
         return "saved"
 
     except Exception as e:
+        import traceback
         print(f"Sheet error: {e}")
+        print(traceback.format_exc())
         return "error"
 
 
