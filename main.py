@@ -20,6 +20,7 @@ YT_API_KEY    = os.environ.get("YT_API_KEY")
 YT_CHANNEL    = os.environ.get("YT_CHANNEL")
 FB_PAGE_TOKEN = os.environ.get("FB_PAGE_TOKEN")
 FB_PAGE_ID    = os.environ.get("FB_PAGE_ID")
+IG_ACCOUNT_ID = os.environ.get("IG_ACCOUNT_ID")
 
 TELEGRAM_API = f"https://api.telegram.org/bot{BOT_TOKEN}"
 
@@ -91,13 +92,14 @@ def handle_callback(callback):
     answer_callback(callback_id)
 
     if data == "followers":
-        yt = get_youtube_subscribers()
         fb = get_facebook_followers()
+        ig = get_instagram_followers()
+        yt = get_youtube_subscribers()
         send_message(chat_id,
             f"📊 Radical Revolution Followers\n\n"
             f"👍 Facebook: {fb}\n"
+            f"📸 Instagram: {ig}\n"
             f"▶️ YouTube: {yt}\n\n"
-            f"📸 Instagram — coming soon!\n"
             f"🎵 TikTok — coming soon!"
         )
 
@@ -178,6 +180,22 @@ def get_facebook_followers():
         return f"{count:,}"
     except Exception as e:
         print(f"Facebook error: {e}")
+        return "unavailable"
+
+
+# ============================================
+# GET INSTAGRAM FOLLOWERS
+# Fetches exact count using Instagram Business
+# Account ID with commas formatting.
+# ============================================
+def get_instagram_followers():
+    try:
+        url    = f"https://graph.facebook.com/{IG_ACCOUNT_ID}?fields=followers_count&access_token={FB_PAGE_TOKEN}"
+        result = requests.get(url).json()
+        count  = int(result["followers_count"])
+        return f"{count:,}"
+    except Exception as e:
+        print(f"Instagram error: {e}")
         return "unavailable"
 
 
