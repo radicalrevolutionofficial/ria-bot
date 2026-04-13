@@ -19,6 +19,7 @@ SHEET_ID        = os.environ.get("SHEET_ID")
 SHEET_NAME      = os.environ.get("SHEET_NAME", "Sheet1")
 TESTING_SHEET   = "testing C2"
 BOT_ID          = int(os.environ.get("BOT_ID", "8726579895"))
+ADMIN_CHAT_ID   = os.environ.get("ADMIN_CHAT_ID")
 YT_API_KEY      = os.environ.get("YT_API_KEY")
 YT_CHANNEL      = os.environ.get("YT_CHANNEL")
 FB_PAGE_TOKEN   = os.environ.get("FB_PAGE_TOKEN")
@@ -27,8 +28,8 @@ IG_ACCOUNT_ID   = os.environ.get("IG_ACCOUNT_ID")
 THREADS_TOKEN   = os.environ.get("THREADS_TOKEN")
 THREADS_USER_ID = os.environ.get("THREADS_USER_ID")
 DRIVE_FOLDER_ID = "1mCEdx7wAxbUGBkAmtgy6XTEbBDtGqDl4"
-FB_VERIFY_TOKEN = "ria_bot_verify_123"
-LIKES_THRESHOLD = 10000
+FB_VERIFY_TOKEN    = "ria_bot_verify_123"
+LIKES_THRESHOLD    = 10000
 DAYS_BEFORE_DELETE = 7
 
 APP_ID       = "1619028032581015"
@@ -41,7 +42,6 @@ TELEGRAM_API = f"https://api.telegram.org/bot{BOT_TOKEN}"
 
 # ============================================
 # GOOGLE CREDENTIALS HELPER
-# Returns credentials with both Sheets and Drive scopes.
 # ============================================
 def get_google_creds():
     creds_json = os.environ.get("GOOGLE_CREDS")
@@ -62,7 +62,6 @@ def get_sheets_client():
 
 # ============================================
 # FACEBOOK WEBHOOK VERIFICATION
-# Facebook calls this to verify the webhook URL.
 # ============================================
 @app.route("/fb-webhook", methods=["GET"])
 def fb_webhook_verify():
@@ -78,8 +77,8 @@ def fb_webhook_verify():
 
 # ============================================
 # FACEBOOK WEBHOOK EVENTS
-# Receives new post notifications from Facebook.
-# Detects photo posts and saves to testing C2 sheet.
+# Detects new photo posts and saves to testing C2.
+# No Telegram notification on add.
 # ============================================
 @app.route("/fb-webhook", methods=["POST"])
 def fb_webhook_receive():
@@ -92,7 +91,6 @@ def fb_webhook_receive():
                 if change.get("field") == "feed":
                     value = change.get("value", {})
 
-                    # Only process photo posts
                     if value.get("item") == "photo" and value.get("verb") == "add":
                         post_id    = value.get("post_id", "")
                         message    = value.get("message", "")
@@ -107,7 +105,7 @@ def fb_webhook_receive():
 
 # ============================================
 # SAVE TO TESTING C2 SHEET
-# Saves new FB post data to "testing C2" sheet.
+# Saves new FB post — no notification sent.
 # ============================================
 def save_to_testing_sheet(post_id, created_at, message):
     try:
@@ -115,19 +113,16 @@ def save_to_testing_sheet(post_id, created_at, message):
         sheet = gc.open_by_key(SHEET_ID).worksheet(TESTING_SHEET)
         rows  = sheet.get_all_values()
 
-        # Add header if sheet is empty
         if len(rows) == 0:
             sheet.append_row([
                 "Content ID", "Date & Time Posted",
-                "C2 Text", "Likes", "Reached", "Reached Y/N"
+                "C2 Text", "Likes", "Reached"
             ])
 
-        # Check if post already exists
         for row in rows[1:]:
             if str(row[0]).strip() == post_id:
                 return
 
-        # Get initial likes and reached from Facebook
         likes, reached = get_post_stats(post_id)
 
         sheet.append_row([
@@ -135,8 +130,7 @@ def save_to_testing_sheet(post_id, created_at, message):
             created_at,
             message,
             likes,
-            reached,
-            "N"
+            reached
         ])
         print(f"Saved post {post_id} to testing C2")
 
@@ -146,7 +140,6 @@ def save_to_testing_sheet(post_id, created_at, message):
 
 # ============================================
 # GET POST STATS FROM FACEBOOK
-# Fetches current likes and reached for a post.
 # ============================================
 def get_post_stats(post_id):
     try:
@@ -166,17 +159,17 @@ def get_post_stats(post_id):
 
 # ============================================
 # DAILY 7AM JOB
-# Triggered by visiting /daily-job URL.
 # Updates all posts, moves winners to Sheet1,
 # saves images to Drive, deletes old losers.
+# Notifies admin on Telegram for wins and deletes.
 # ============================================
 @app.route("/daily-job", methods=["GET"])
 def daily_job():
     try:
-        gc           = get_sheets_client()
-        testing      = gc.open_by_key(SHEET_ID).worksheet(TESTING_SHEET)
-        sheet1       = gc.open_by_key(SHEET_ID).worksheet(SHEET_NAME)
-        rows         = testing.get_all_values()
+        gc            = get_sheets_client()
+        testing       = gc.open_by_key(SHEET_ID).worksheet(TESTING_SHEET)
+        sheet1        = gc.open_by_key(SHEET_ID).worksheet(SHEET_NAME)
+        rows          = testing.get_all_values()
         drive_service = build("drive", "v3", credentials=get_google_creds())
 
         if len(rows) <= 1:
@@ -186,7 +179,7 @@ def daily_job():
         now = datetime.now(PH_TZ)
 
         for i, row in enumerate(rows[1:], start=2):
-            if len(row) < 6:
+            if len(row) < 5:
                 continue
 
             post_id    = row[0].strip()
@@ -206,10 +199,10 @@ def daily_job():
             except:
                 age_days = 0
 
+            preview = c2_text[:60] + "..." if len(c2_text) > 60 else c2_text
+
             # Winner — likes >= 10,000
             if likes >= LIKES_THRESHOLD:
-                testing.update_cell(i, 6, "Y")
-
                 # Save to Sheet1
                 sheet1_rows = sheet1.get_all_values()
                 if len(sheet1_rows) == 0:
@@ -226,14 +219,33 @@ def daily_job():
                 # Save image to Google Drive
                 save_image_to_drive(post_id, drive_service)
 
-                # Mark for deletion from testing sheet
+                # Notify admin — winner!
+                notify(
+                    f"🏆 A-RR Winner!\n\n"
+                    f"📝 \"{preview}\"\n"
+                    f"👍 Likes: {likes:,}\n"
+                    f"👁️ Reached: {reached:,}\n\n"
+                    f"✅ Moved to Sheet1 (A-RR database)\n"
+                    f"🖼️ Image saved to Google Drive\n"
+                    f"🆔 ID: {post_id}"
+                )
+
                 rows_to_delete.append(i)
 
             # Loser — older than 7 days and likes < 10,000
             elif age_days >= DAYS_BEFORE_DELETE:
+                # Notify admin — deleted
+                notify(
+                    f"🗑️ Content deleted from testing C2\n\n"
+                    f"📝 \"{preview}\"\n"
+                    f"👍 Only reached {likes:,} likes in {age_days} days\n"
+                    f"❌ Did not reach {LIKES_THRESHOLD:,} likes threshold\n"
+                    f"🆔 ID: {post_id}"
+                )
+
                 rows_to_delete.append(i)
 
-        # Delete rows in reverse order to preserve row numbers
+        # Delete rows in reverse order
         for row_num in sorted(rows_to_delete, reverse=True):
             testing.delete_rows(row_num)
 
@@ -248,12 +260,9 @@ def daily_job():
 
 # ============================================
 # SAVE IMAGE TO GOOGLE DRIVE
-# Downloads the post image from Facebook and
-# saves it to Google Drive with Content ID as filename.
 # ============================================
 def save_image_to_drive(post_id, drive_service):
     try:
-        # Get image URL from Facebook
         url    = f"https://graph.facebook.com/{post_id}?fields=full_picture&access_token={FB_PAGE_TOKEN}"
         result = requests.get(url).json()
         image_url = result.get("full_picture")
@@ -262,12 +271,10 @@ def save_image_to_drive(post_id, drive_service):
             print(f"No image found for post {post_id}")
             return
 
-        # Download the image
         img_response = requests.get(image_url)
         img_data     = img_response.content
         img_stream   = io.BytesIO(img_data)
 
-        # Upload to Google Drive
         file_metadata = {
             "name":    post_id,
             "parents": [DRIVE_FOLDER_ID]
@@ -283,6 +290,17 @@ def save_image_to_drive(post_id, drive_service):
 
     except Exception as e:
         print(f"Drive upload error: {e}")
+
+
+# ============================================
+# NOTIFY ADMIN ON TELEGRAM
+# Sends notification to admin chat only.
+# ============================================
+def notify(text):
+    if not ADMIN_CHAT_ID:
+        print(f"No ADMIN_CHAT_ID set. Message: {text}")
+        return
+    send_message(ADMIN_CHAT_ID, text)
 
 
 # ============================================
@@ -345,7 +363,7 @@ def threads_callback():
 
 
 # ============================================
-# WEBHOOK ENDPOINT — TELEGRAM
+# TELEGRAM WEBHOOK ENDPOINT
 # ============================================
 @app.route("/webhook", methods=["POST"])
 def webhook():
