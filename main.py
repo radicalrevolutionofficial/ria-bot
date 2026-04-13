@@ -28,7 +28,6 @@ IG_ACCOUNT_ID   = os.environ.get("IG_ACCOUNT_ID")
 THREADS_TOKEN   = os.environ.get("THREADS_TOKEN")
 THREADS_USER_ID = os.environ.get("THREADS_USER_ID")
 DRIVE_FOLDER_ID = "1mCEdx7wAxbUGBkAmtgy6XTEbBDtGqDl4"
-FB_VERIFY_TOKEN    = "ria_bot_verify_123"
 LIKES_THRESHOLD    = 10000
 DAYS_BEFORE_DELETE = 7
 
@@ -61,81 +60,91 @@ def get_sheets_client():
 
 
 # ============================================
-# FACEBOOK WEBHOOK VERIFICATION
+# HOURLY POLL JOB
+# Runs every hour via cron-job.org.
+# Fetches latest photo posts from Facebook Page
+# and saves new ones to testing C2 sheet.
+# No webhook or app review needed.
 # ============================================
-@app.route("/fb-webhook", methods=["GET"])
-def fb_webhook_verify():
-    mode      = request.args.get("hub.mode")
-    token     = request.args.get("hub.verify_token")
-    challenge = request.args.get("hub.challenge")
-
-    if mode == "subscribe" and token == FB_VERIFY_TOKEN:
-        print("Webhook verified!")
-        return challenge, 200
-    return "Forbidden", 403
-
-
-# ============================================
-# FACEBOOK WEBHOOK EVENTS
-# Detects new photo posts and saves to testing C2.
-# No Telegram notification on add.
-# ============================================
-@app.route("/fb-webhook", methods=["POST"])
-def fb_webhook_receive():
-    data = request.get_json()
-    print(f"FB Webhook received: {json.dumps(data)}")
-
-    try:
-        for entry in data.get("entry", []):
-            for change in entry.get("changes", []):
-                if change.get("field") == "feed":
-                    value = change.get("value", {})
-
-                    if value.get("item") == "photo" and value.get("verb") == "add":
-                        post_id    = value.get("post_id", "")
-                        message    = value.get("message", "")
-                        created_at = datetime.now(PH_TZ).strftime("%m/%d/%Y %I:%M %p")
-
-                        save_to_testing_sheet(post_id, created_at, message)
-    except Exception as e:
-        print(f"Webhook error: {e}")
-
-    return "OK", 200
-
-
-# ============================================
-# SAVE TO TESTING C2 SHEET
-# Saves new FB post — no notification sent.
-# ============================================
-def save_to_testing_sheet(post_id, created_at, message):
+@app.route("/poll-posts", methods=["GET"])
+def poll_posts():
     try:
         gc    = get_sheets_client()
         sheet = gc.open_by_key(SHEET_ID).worksheet(TESTING_SHEET)
         rows  = sheet.get_all_values()
 
+        # Add header if sheet is empty
         if len(rows) == 0:
             sheet.append_row([
                 "Content ID", "Date & Time Posted",
                 "C2 Text", "Likes", "Reached"
             ])
+            rows = sheet.get_all_values()
 
+        # Get existing post IDs to avoid duplicates
+        existing_ids = set()
         for row in rows[1:]:
-            if str(row[0]).strip() == post_id:
-                return
+            if row:
+                existing_ids.add(str(row[0]).strip())
 
-        likes, reached = get_post_stats(post_id)
+        # Fetch latest photo posts from Facebook Page
+        url = (
+            f"https://graph.facebook.com/{FB_PAGE_ID}/posts"
+            f"?fields=id,message,created_time,attachments"
+            f"&limit=10"
+            f"&access_token={FB_PAGE_TOKEN}"
+        )
+        result = requests.get(url).json()
+        posts  = result.get("data", [])
 
-        sheet.append_row([
-            post_id,
-            created_at,
-            message,
-            likes,
-            reached
-        ])
-        print(f"Saved post {post_id} to testing C2")
+        new_count = 0
+        for post in posts:
+            post_id     = post.get("id", "")
+            message     = post.get("message", "")
+            created_time = post.get("created_time", "")
+            attachments  = post.get("attachments", {}).get("data", [])
+
+            # Skip if already in sheet
+            if post_id in existing_ids:
+                continue
+
+            # Only process posts with photo attachments
+            has_photo = any(
+                a.get("type") in ["photo", "album"] 
+                for a in attachments
+            )
+            if not has_photo:
+                continue
+
+            # Format date to PH time
+            try:
+                utc_time = datetime.strptime(created_time, "%Y-%m-%dT%H:%M:%S+0000")
+                ph_time  = utc_time.replace(tzinfo=timezone.utc).astimezone(PH_TZ)
+                formatted_date = ph_time.strftime("%m/%d/%Y %I:%M %p")
+            except:
+                formatted_date = datetime.now(PH_TZ).strftime("%m/%d/%Y %I:%M %p")
+
+            # Get initial likes and reached
+            likes, reached = get_post_stats(post_id)
+
+            # Save to testing C2
+            sheet.append_row([
+                post_id,
+                formatted_date,
+                message,
+                likes,
+                reached
+            ])
+            existing_ids.add(post_id)
+            new_count += 1
+
+        return f"Poll done! {new_count} new posts added.", 200
 
     except Exception as e:
-        print(f"Testing sheet error: {e}")
+        import traceback
+        print(f"Poll error: {e}")
+        print(traceback.format_exc())
+        return f"Error: {e}", 500
 
 
 # ============================================
@@ -143,8 +152,12 @@ def save_to_testing_sheet(post_id, created_at, message):
 # ============================================
 def get_post_stats(post_id):
     try:
-        url    = f"https://graph.facebook.com/{post_id}?fields=likes.summary(true),insights.metric(post_impressions_unique)&access_token={FB_PAGE_TOKEN}"
-        result = requests.get(url).json()
+        url    = (
+            f"https://graph.facebook.com/{post_id}"
+            f"?fields=likes.summary(true),insights.metric(post_impressions_unique)"
+            f"&access_token={FB_PAGE_TOKEN}"
+        )
+        result  = requests.get(url).json()
         likes   = result.get("likes", {}).get("summary", {}).get("total_count", 0)
         reached = 0
         insights = result.get("insights", {}).get("data", [])
@@ -232,9 +245,8 @@ def daily_job():
 
                 rows_to_delete.append(i)
 
-            # Loser — older than 7 days and likes < 10,000
+            # Loser — older than 7 days
             elif age_days >= DAYS_BEFORE_DELETE:
-                # Notify admin — deleted
                 notify(
                     f"🗑️ Content deleted from testing C2\n\n"
                     f"📝 \"{preview}\"\n"
@@ -294,7 +306,6 @@ def save_image_to_drive(post_id, drive_service):
 
 # ============================================
 # NOTIFY ADMIN ON TELEGRAM
-# Sends notification to admin chat only.
 # ============================================
 def notify(text):
     if not ADMIN_CHAT_ID:
