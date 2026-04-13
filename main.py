@@ -100,7 +100,7 @@ def poll_posts():
         new_count = 0
         for post in posts:
             post_id     = post.get("id", "")
-            message     = post.get("message", "")
+            message = post.get("message", "").split("\n")[0].strip()
             created_time = post.get("created_time", "")
             attachments  = post.get("attachments", {}).get("data", [])
 
