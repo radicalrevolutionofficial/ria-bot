@@ -39,9 +39,6 @@ PH_TZ        = timezone(timedelta(hours=8))
 TELEGRAM_API = f"https://api.telegram.org/bot{BOT_TOKEN}"
 
 
-# ============================================
-# GOOGLE CREDENTIALS HELPER
-# ============================================
 def get_google_creds():
     creds_json = os.environ.get("GOOGLE_CREDS")
     creds_dict = json.loads(creds_json)
@@ -52,19 +49,14 @@ def get_google_creds():
     return Credentials.from_service_account_info(creds_dict, scopes=scopes)
 
 
-# ============================================
-# GOOGLE SHEETS CLIENT
-# ============================================
 def get_sheets_client():
     return gspread.authorize(get_google_creds())
 
 
 # ============================================
 # HOURLY POLL JOB
-# Runs every hour via cron-job.org.
-# Fetches latest photo posts from Facebook Page
-# and saves new ones to testing C2 sheet.
-# No webhook or app review needed.
+# 1. Adds new photo posts to bottom of sheet
+# 2. Updates likes & reached for all existing posts
 # ============================================
 @app.route("/poll-posts", methods=["GET"])
 def poll_posts():
@@ -73,21 +65,27 @@ def poll_posts():
         sheet = gc.open_by_key(SHEET_ID).worksheet(TESTING_SHEET)
         rows  = sheet.get_all_values()
 
-        # Add header if sheet is empty
         if len(rows) == 0:
-            sheet.append_row([
-                "Content ID", "Date & Time Posted",
-                "C2 Text", "Likes", "Reached"
-            ])
+            sheet.append_row(["Content ID", "Date & Time Posted", "C2 Text", "Likes", "Reached"])
             rows = sheet.get_all_values()
 
-        # Get existing post IDs to avoid duplicates
+        # Get existing post IDs
         existing_ids = set()
         for row in rows[1:]:
             if row:
                 existing_ids.add(str(row[0]).strip())
 
-        # Fetch latest photo posts from Facebook Page
+        # Update likes & reached for all existing posts
+        for i, row in enumerate(rows[1:], start=2):
+            if len(row) < 1:
+                continue
+            post_id = row[0].strip()
+            if post_id:
+                likes, reached = get_post_stats(post_id)
+                sheet.update_cell(i, 4, likes)
+                sheet.update_cell(i, 5, reached)
+
+        # Fetch latest posts from Facebook Page
         url = (
             f"https://graph.facebook.com/{FB_PAGE_ID}/posts"
             f"?fields=id,message,created_time,attachments"
@@ -97,20 +95,22 @@ def poll_posts():
         result = requests.get(url).json()
         posts  = result.get("data", [])
 
+        # Reverse so oldest is first — newest goes to bottom of sheet
+        posts = list(reversed(posts))
+
         new_count = 0
         for post in posts:
-            post_id     = post.get("id", "")
-            message = post.get("message", "").split("\n")[0].strip()
+            post_id      = post.get("id", "")
+            message      = post.get("message", "")
             created_time = post.get("created_time", "")
             attachments  = post.get("attachments", {}).get("data", [])
 
-            # Skip if already in sheet
             if post_id in existing_ids:
                 continue
 
-            # Only process posts with photo attachments
+            # Only process photo posts
             has_photo = any(
-                a.get("type") in ["photo", "album"] 
+                a.get("type") in ["photo", "album"]
                 for a in attachments
             )
             if not has_photo:
@@ -124,21 +124,18 @@ def poll_posts():
             except:
                 formatted_date = datetime.now(PH_TZ).strftime("%m/%d/%Y %I:%M %p")
 
+            # First line only as C2 text
+            c2_text = message.split("\n")[0].strip()
+
             # Get initial likes and reached
             likes, reached = get_post_stats(post_id)
 
-            # Save to testing C2
-            sheet.append_row([
-                post_id,
-                formatted_date,
-                message,
-                likes,
-                reached
-            ])
+            # Append to bottom of sheet
+            sheet.append_row([post_id, formatted_date, c2_text, likes, reached])
             existing_ids.add(post_id)
             new_count += 1
 
-        return f"Poll done! {new_count} new posts added.", 200
+        return f"Poll done! {new_count} new posts added. All likes/reached updated.", 200
 
     except Exception as e:
         import traceback
@@ -152,14 +149,14 @@ def poll_posts():
 # ============================================
 def get_post_stats(post_id):
     try:
-        url    = (
+        url = (
             f"https://graph.facebook.com/{post_id}"
             f"?fields=likes.summary(true),insights.metric(post_impressions_unique)"
             f"&access_token={FB_PAGE_TOKEN}"
         )
-        result  = requests.get(url).json()
-        likes   = result.get("likes", {}).get("summary", {}).get("total_count", 0)
-        reached = 0
+        result   = requests.get(url).json()
+        likes    = result.get("likes", {}).get("summary", {}).get("total_count", 0)
+        reached  = 0
         insights = result.get("insights", {}).get("data", [])
         for insight in insights:
             if insight.get("name") == "post_impressions_unique":
@@ -172,9 +169,8 @@ def get_post_stats(post_id):
 
 # ============================================
 # DAILY 7AM JOB
-# Updates all posts, moves winners to Sheet1,
-# saves images to Drive, deletes old losers.
-# Notifies admin on Telegram for wins and deletes.
+# Moves winners to Sheet1, saves images to Drive,
+# deletes old losers. Notifies admin on Telegram.
 # ============================================
 @app.route("/daily-job", methods=["GET"])
 def daily_job():
@@ -198,11 +194,8 @@ def daily_job():
             post_id    = row[0].strip()
             created_at = row[1].strip()
             c2_text    = row[2].strip()
-
-            # Update likes and reached
-            likes, reached = get_post_stats(post_id)
-            testing.update_cell(i, 4, likes)
-            testing.update_cell(i, 5, reached)
+            likes      = int(row[3]) if row[3] else 0
+            reached    = int(row[4]) if row[4] else 0
 
             # Check post age
             try:
@@ -216,23 +209,17 @@ def daily_job():
 
             # Winner — likes >= 10,000
             if likes >= LIKES_THRESHOLD:
-                # Save to Sheet1
                 sheet1_rows = sheet1.get_all_values()
                 if len(sheet1_rows) == 0:
                     sheet1.append_row(["Message ID", "Date Added", "C2 Text", "Likes", "Reached", "Platform"])
                 sheet1.append_row([
                     post_id,
                     now.strftime("%m/%d/%Y"),
-                    c2_text,
-                    likes,
-                    reached,
-                    "Facebook"
+                    c2_text, likes, reached, "Facebook"
                 ])
 
-                # Save image to Google Drive
                 save_image_to_drive(post_id, drive_service)
 
-                # Notify admin — winner!
                 notify(
                     f"🏆 A-RR Winner!\n\n"
                     f"📝 \"{preview}\"\n"
@@ -242,7 +229,6 @@ def daily_job():
                     f"🖼️ Image saved to Google Drive\n"
                     f"🆔 ID: {post_id}"
                 )
-
                 rows_to_delete.append(i)
 
             # Loser — older than 7 days
@@ -254,10 +240,8 @@ def daily_job():
                     f"❌ Did not reach {LIKES_THRESHOLD:,} likes threshold\n"
                     f"🆔 ID: {post_id}"
                 )
-
                 rows_to_delete.append(i)
 
-        # Delete rows in reverse order
         for row_num in sorted(rows_to_delete, reverse=True):
             testing.delete_rows(row_num)
 
@@ -275,30 +259,19 @@ def daily_job():
 # ============================================
 def save_image_to_drive(post_id, drive_service):
     try:
-        url    = f"https://graph.facebook.com/{post_id}?fields=full_picture&access_token={FB_PAGE_TOKEN}"
-        result = requests.get(url).json()
+        url       = f"https://graph.facebook.com/{post_id}?fields=full_picture&access_token={FB_PAGE_TOKEN}"
+        result    = requests.get(url).json()
         image_url = result.get("full_picture")
 
         if not image_url:
-            print(f"No image found for post {post_id}")
             return
 
-        img_response = requests.get(image_url)
-        img_data     = img_response.content
-        img_stream   = io.BytesIO(img_data)
+        img_data   = requests.get(image_url).content
+        img_stream = io.BytesIO(img_data)
 
-        file_metadata = {
-            "name":    post_id,
-            "parents": [DRIVE_FOLDER_ID]
-        }
+        file_metadata = {"name": post_id, "parents": [DRIVE_FOLDER_ID]}
         media = MediaIoBaseUpload(img_stream, mimetype="image/jpeg")
-        drive_service.files().create(
-            body=file_metadata,
-            media_body=media,
-            fields="id"
-        ).execute()
-
-        print(f"Image saved to Drive for post {post_id}")
+        drive_service.files().create(body=file_metadata, media_body=media, fields="id").execute()
 
     except Exception as e:
         print(f"Drive upload error: {e}")
@@ -309,7 +282,6 @@ def save_image_to_drive(post_id, drive_service):
 # ============================================
 def notify(text):
     if not ADMIN_CHAT_ID:
-        print(f"No ADMIN_CHAT_ID set. Message: {text}")
         return
     send_message(ADMIN_CHAT_ID, text)
 
@@ -339,16 +311,13 @@ def threads_callback():
         return "Error: No code received", 400
 
     response = requests.post("https://graph.threads.net/oauth/access_token", data={
-        "client_id":     APP_ID,
-        "client_secret": APP_SECRET,
-        "grant_type":    "authorization_code",
-        "redirect_uri":  REDIRECT_URI,
-        "code":          code
+        "client_id": APP_ID, "client_secret": APP_SECRET,
+        "grant_type": "authorization_code",
+        "redirect_uri": REDIRECT_URI, "code": code
     })
     data = response.json()
-
     if "access_token" not in data:
-        return f"Error getting token: {data}", 400
+        return f"Error: {data}", 400
 
     short_token = data["access_token"]
     user_id     = data["user_id"]
@@ -359,22 +328,21 @@ def threads_callback():
         f"&client_secret={APP_SECRET}"
         f"&access_token={short_token}"
     )
-    ll_data    = ll_response.json()
-    long_token = ll_data.get("access_token", short_token)
+    long_token = ll_response.json().get("access_token", short_token)
 
     return f"""
     <h2>✅ Threads Connected!</h2>
     <p><strong>User ID:</strong> {user_id}</p>
-    <p><strong>Long-lived Token:</strong><br>
+    <p><strong>Token:</strong><br>
     <textarea rows="4" cols="80">{long_token}</textarea></p>
-    <p>Add to Render environment variables:<br>
+    <p>Add to Render:<br>
     <strong>THREADS_USER_ID</strong> = {user_id}<br>
-    <strong>THREADS_TOKEN</strong> = (the token above)</p>
+    <strong>THREADS_TOKEN</strong> = token above</p>
     """
 
 
 # ============================================
-# TELEGRAM WEBHOOK ENDPOINT
+# TELEGRAM WEBHOOK
 # ============================================
 @app.route("/webhook", methods=["POST"])
 def webhook():
@@ -429,7 +397,6 @@ def handle_callback(callback):
     chat_id     = callback["message"]["chat"]["id"]
     data        = callback["data"]
     callback_id = callback["id"]
-
     answer_callback(callback_id)
 
     if data == "followers":
@@ -460,7 +427,7 @@ def handle_callback(callback):
 
 
 # ============================================
-# SAVE TO SHEET1 (A-RR DATABASE)
+# SAVE TO SHEET1
 # ============================================
 def save_to_sheet(message_id, c2, likes, reached):
     try:
@@ -482,11 +449,7 @@ def save_to_sheet(message_id, c2, likes, reached):
                 str(row[4]).strip() == reached):
                 return "duplicate"
 
-        sheet.append_row([
-            message_id,
-            datetime.now().strftime("%m/%d/%Y"),
-            c2, likes, reached, "Facebook"
-        ])
+        sheet.append_row([message_id, datetime.now().strftime("%m/%d/%Y"), c2, likes, reached, "Facebook"])
         return "saved"
 
     except Exception as e:
@@ -496,67 +459,45 @@ def save_to_sheet(message_id, c2, likes, reached):
         return "error"
 
 
-# ============================================
-# GET YOUTUBE SUBSCRIBERS
-# ============================================
 def get_youtube_subscribers():
     try:
         url    = f"https://www.googleapis.com/youtube/v3/channels?part=statistics&id={YT_CHANNEL}&key={YT_API_KEY}"
         result = requests.get(url).json()
         count  = int(result["items"][0]["statistics"]["subscriberCount"])
         return f"{count:,}"
-    except Exception as e:
-        print(f"YouTube error: {e}")
+    except:
         return "unavailable"
 
 
-# ============================================
-# GET FACEBOOK FOLLOWERS
-# ============================================
 def get_facebook_followers():
     try:
         url    = f"https://graph.facebook.com/{FB_PAGE_ID}?fields=followers_count&access_token={FB_PAGE_TOKEN}"
         result = requests.get(url).json()
-        count  = int(result["followers_count"])
-        return f"{count:,}"
-    except Exception as e:
-        print(f"Facebook error: {e}")
+        return f"{int(result['followers_count']):,}"
+    except:
         return "unavailable"
 
 
-# ============================================
-# GET INSTAGRAM FOLLOWERS
-# ============================================
 def get_instagram_followers():
     try:
         url    = f"https://graph.facebook.com/{IG_ACCOUNT_ID}?fields=followers_count&access_token={FB_PAGE_TOKEN}"
         result = requests.get(url).json()
-        count  = int(result["followers_count"])
-        return f"{count:,}"
-    except Exception as e:
-        print(f"Instagram error: {e}")
+        return f"{int(result['followers_count']):,}"
+    except:
         return "unavailable"
 
 
-# ============================================
-# GET THREADS FOLLOWERS
-# ============================================
 def get_threads_followers():
     try:
         if not THREADS_TOKEN or not THREADS_USER_ID:
             return "coming soon!"
         url    = f"https://graph.threads.net/v1.0/{THREADS_USER_ID}?fields=followers_count&access_token={THREADS_TOKEN}"
         result = requests.get(url).json()
-        count  = int(result["followers_count"])
-        return f"{count:,}"
-    except Exception as e:
-        print(f"Threads error: {e}")
+        return f"{int(result['followers_count']):,}"
+    except:
         return "unavailable"
 
 
-# ============================================
-# SEND MENU
-# ============================================
 def send_menu(chat_id):
     requests.post(f"{TELEGRAM_API}/sendMessage", json={
         "chat_id": chat_id,
@@ -570,28 +511,14 @@ def send_menu(chat_id):
     })
 
 
-# ============================================
-# SEND MESSAGE
-# ============================================
 def send_message(chat_id, text):
-    requests.post(f"{TELEGRAM_API}/sendMessage", json={
-        "chat_id": chat_id,
-        "text": text
-    })
+    requests.post(f"{TELEGRAM_API}/sendMessage", json={"chat_id": chat_id, "text": text})
 
 
-# ============================================
-# ANSWER CALLBACK
-# ============================================
 def answer_callback(callback_id):
-    requests.post(f"{TELEGRAM_API}/answerCallbackQuery", json={
-        "callback_query_id": callback_id
-    })
+    requests.post(f"{TELEGRAM_API}/answerCallbackQuery", json={"callback_query_id": callback_id})
 
 
-# ============================================
-# HEALTH CHECK
-# ============================================
 @app.route("/", methods=["GET"])
 def health():
     return "Ria Bot is running!", 200
