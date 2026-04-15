@@ -154,8 +154,8 @@ def get_post_stats(post_id):
             f"?fields=reactions.summary(true),insights.metric(post_impressions_unique)"
             f"&access_token={FB_PAGE_TOKEN}"
         )
-        result  = requests.get(url).json()
-        likes   = result.get("reactions", {}).get("summary", {}).get("total_count", 0)
+        result   = requests.get(url).json()
+        likes    = result.get("reactions", {}).get("summary", {}).get("total_count", 0)
         reached  = 0
         insights = result.get("insights", {}).get("data", [])
         for insight in insights:
