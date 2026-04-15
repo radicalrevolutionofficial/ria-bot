@@ -54,19 +54,24 @@ def get_sheets_client():
 
 
 # ============================================
-# HOURLY POLL JOB
-# 1. Adds new photo posts to bottom of sheet
-# 2. Updates likes & reached for all existing posts
+# EVERY 5 MINUTES JOB
+# 1. Fetch new photo posts → add to testing C2
+# 2. Update reactions for all existing posts
+# 3. Check winners → move to Sheet1 + Drive
+# 4. Delete posts older than 7 days
 # ============================================
 @app.route("/poll-posts", methods=["GET"])
 def poll_posts():
     try:
-        gc    = get_sheets_client()
-        sheet = gc.open_by_key(SHEET_ID).worksheet(TESTING_SHEET)
-        rows  = sheet.get_all_values()
+        gc            = get_sheets_client()
+        sheet         = gc.open_by_key(SHEET_ID).worksheet(TESTING_SHEET)
+        sheet1        = gc.open_by_key(SHEET_ID).worksheet(SHEET_NAME)
+        rows          = sheet.get_all_values()
+        drive_service = build("drive", "v3", credentials=get_google_creds())
 
+        # Add header if sheet is empty
         if len(rows) == 0:
-            sheet.append_row(["Content ID", "Date & Time Posted", "C2 Text", "Likes", "Reached"])
+            sheet.append_row(["Content ID", "Date & Time Posted", "C2 Text", "Reactions", "Reached"])
             rows = sheet.get_all_values()
 
         # Get existing post IDs
@@ -75,17 +80,9 @@ def poll_posts():
             if row:
                 existing_ids.add(str(row[0]).strip())
 
-        # Update likes & reached for all existing posts
-        for i, row in enumerate(rows[1:], start=2):
-            if len(row) < 1:
-                continue
-            post_id = row[0].strip()
-            if post_id:
-                likes, reached = get_post_stats(post_id)
-                sheet.update_cell(i, 4, likes)
-                sheet.update_cell(i, 5, reached)
-
-        # Fetch latest posts from Facebook Page
+        # ----------------------------------------
+        # STEP 1 — Fetch new photo posts from FB
+        # ----------------------------------------
         url = (
             f"https://graph.facebook.com/{FB_PAGE_ID}/posts"
             f"?fields=id,message,created_time,attachments"
@@ -93,12 +90,8 @@ def poll_posts():
             f"&access_token={FB_PAGE_TOKEN}"
         )
         result = requests.get(url).json()
-        posts  = result.get("data", [])
+        posts  = list(reversed(result.get("data", [])))
 
-        # Reverse so oldest is first — newest goes to bottom of sheet
-        posts = list(reversed(posts))
-
-        new_count = 0
         for post in posts:
             post_id      = post.get("id", "")
             message      = post.get("message", "")
@@ -108,15 +101,10 @@ def poll_posts():
             if post_id in existing_ids:
                 continue
 
-            # Only process photo posts
-            has_photo = any(
-                a.get("type") in ["photo", "album"]
-                for a in attachments
-            )
+            has_photo = any(a.get("type") in ["photo", "album"] for a in attachments)
             if not has_photo:
                 continue
 
-            # Format date to PH time
             try:
                 utc_time = datetime.strptime(created_time, "%Y-%m-%dT%H:%M:%S+0000")
                 ph_time  = utc_time.replace(tzinfo=timezone.utc).astimezone(PH_TZ)
@@ -124,68 +112,25 @@ def poll_posts():
             except:
                 formatted_date = datetime.now(PH_TZ).strftime("%m/%d/%Y %I:%M %p")
 
-            # First line only as C2 text
-            c2_text = message.split("\n")[0].strip()
+            c2_text          = message.split("\n")[0].strip()
+            reactions, reached = get_post_stats(post_id)
 
-            # Get initial likes and reached
-            likes, reached = get_post_stats(post_id)
-
-            # Append to bottom of sheet
-            sheet.append_row([post_id, formatted_date, c2_text, likes, reached])
+            # Save with comma-formatted numbers
+            sheet.append_row([
+                post_id,
+                formatted_date,
+                c2_text,
+                f"{reactions:,}",
+                f"{reached:,}"
+            ])
             existing_ids.add(post_id)
-            new_count += 1
 
-        return f"Poll done! {new_count} new posts added. All likes/reached updated.", 200
-
-    except Exception as e:
-        import traceback
-        print(f"Poll error: {e}")
-        print(traceback.format_exc())
-        return f"Error: {e}", 500
-
-
-# ============================================
-# GET POST STATS FROM FACEBOOK
-# ============================================
-def get_post_stats(post_id):
-    try:
-        url = (
-            f"https://graph.facebook.com/{post_id}"
-            f"?fields=reactions.summary(true),insights.metric(post_impressions_unique)"
-            f"&access_token={FB_PAGE_TOKEN}"
-        )
-        result   = requests.get(url).json()
-        likes    = result.get("reactions", {}).get("summary", {}).get("total_count", 0)
-        reached  = 0
-        insights = result.get("insights", {}).get("data", [])
-        for insight in insights:
-            if insight.get("name") == "post_impressions_unique":
-                reached = insight.get("values", [{}])[-1].get("value", 0)
-        return likes, reached
-    except Exception as e:
-        print(f"Post stats error: {e}")
-        return 0, 0
-
-
-# ============================================
-# DAILY 7AM JOB
-# Moves winners to Sheet1, saves images to Drive,
-# deletes old losers. Notifies admin on Telegram.
-# ============================================
-@app.route("/daily-job", methods=["GET"])
-def daily_job():
-    try:
-        gc            = get_sheets_client()
-        testing       = gc.open_by_key(SHEET_ID).worksheet(TESTING_SHEET)
-        sheet1        = gc.open_by_key(SHEET_ID).worksheet(SHEET_NAME)
-        rows          = testing.get_all_values()
-        drive_service = build("drive", "v3", credentials=get_google_creds())
-
-        if len(rows) <= 1:
-            return "No posts to process", 200
-
+        # ----------------------------------------
+        # STEP 2 — Update reactions + check winners
+        # ----------------------------------------
+        rows          = sheet.get_all_values()
         rows_to_delete = []
-        now = datetime.now(PH_TZ)
+        now            = datetime.now(PH_TZ)
 
         for i, row in enumerate(rows[1:], start=2):
             if len(row) < 5:
@@ -194,8 +139,16 @@ def daily_job():
             post_id    = row[0].strip()
             created_at = row[1].strip()
             c2_text    = row[2].strip()
-            likes      = int(row[3]) if row[3] else 0
-            reached    = int(row[4]) if row[4] else 0
+
+            if not post_id:
+                continue
+
+            # Update reactions and reached
+            reactions, reached = get_post_stats(post_id)
+
+            # Write comma-formatted numbers to sheet
+            sheet.update_cell(i, 4, f"{reactions:,}")
+            sheet.update_cell(i, 5, f"{reached:,}")
 
             # Check post age
             try:
@@ -207,23 +160,29 @@ def daily_job():
 
             preview = c2_text[:60] + "..." if len(c2_text) > 60 else c2_text
 
-            # Winner — likes >= 10,000
-            if likes >= LIKES_THRESHOLD:
+            # Winner — reactions >= 10,000
+            if reactions >= LIKES_THRESHOLD:
+                # Save to Sheet1
                 sheet1_rows = sheet1.get_all_values()
                 if len(sheet1_rows) == 0:
-                    sheet1.append_row(["Message ID", "Date Added", "C2 Text", "Likes", "Reached", "Platform"])
+                    sheet1.append_row(["Message ID", "Date Added", "C2 Text", "Reactions", "Reached", "Platform"])
                 sheet1.append_row([
                     post_id,
                     now.strftime("%m/%d/%Y"),
-                    c2_text, likes, reached, "Facebook"
+                    c2_text,
+                    f"{reactions:,}",
+                    f"{reached:,}",
+                    "Facebook"
                 ])
 
+                # Save image to Google Drive
                 save_image_to_drive(post_id, drive_service)
 
+                # Notify admin
                 notify(
                     f"🏆 A-RR Winner!\n\n"
                     f"📝 \"{preview}\"\n"
-                    f"👍 Likes: {likes:,}\n"
+                    f"❤️ Reactions: {reactions:,}\n"
                     f"👁️ Reached: {reached:,}\n\n"
                     f"✅ Moved to Sheet1 (A-RR database)\n"
                     f"🖼️ Image saved to Google Drive\n"
@@ -236,45 +195,86 @@ def daily_job():
                 notify(
                     f"🗑️ Content deleted from testing C2\n\n"
                     f"📝 \"{preview}\"\n"
-                    f"👍 Only reached {likes:,} likes in {age_days} days\n"
-                    f"❌ Did not reach {LIKES_THRESHOLD:,} likes threshold\n"
+                    f"❤️ Only reached {reactions:,} reactions in {age_days} days\n"
+                    f"❌ Did not reach {LIKES_THRESHOLD:,} reactions threshold\n"
                     f"🆔 ID: {post_id}"
                 )
                 rows_to_delete.append(i)
 
+        # Delete rows in reverse order
         for row_num in sorted(rows_to_delete, reverse=True):
-            testing.delete_rows(row_num)
+            sheet.delete_rows(row_num)
 
-        return f"Daily job done! Processed {len(rows) - 1} posts.", 200
+        return f"Done! Updated {len(rows)-1} posts.", 200
 
     except Exception as e:
         import traceback
-        print(f"Daily job error: {e}")
+        print(f"Poll error: {e}")
         print(traceback.format_exc())
         return f"Error: {e}", 500
 
 
 # ============================================
+# GET POST STATS FROM FACEBOOK
+# Returns total reactions (all types) and reached.
+# ============================================
+def get_post_stats(post_id):
+    try:
+        url = (
+            f"https://graph.facebook.com/{post_id}"
+            f"?fields=reactions.summary(true),insights.metric(post_impressions_unique)"
+            f"&access_token={FB_PAGE_TOKEN}"
+        )
+        result    = requests.get(url).json()
+        reactions = result.get("reactions", {}).get("summary", {}).get("total_count", 0)
+        reached   = 0
+        insights  = result.get("insights", {}).get("data", [])
+        for insight in insights:
+            if insight.get("name") == "post_impressions_unique":
+                reached = insight.get("values", [{}])[-1].get("value", 0)
+        return reactions, reached
+    except Exception as e:
+        print(f"Post stats error: {e}")
+        return 0, 0
+
+
+# ============================================
 # SAVE IMAGE TO GOOGLE DRIVE
+# Downloads post image and uploads to Drive folder.
 # ============================================
 def save_image_to_drive(post_id, drive_service):
     try:
+        # Get image URL from Facebook
         url       = f"https://graph.facebook.com/{post_id}?fields=full_picture&access_token={FB_PAGE_TOKEN}"
         result    = requests.get(url).json()
         image_url = result.get("full_picture")
 
         if not image_url:
+            print(f"No image found for post {post_id}")
             return
 
+        # Download image
         img_data   = requests.get(image_url).content
         img_stream = io.BytesIO(img_data)
 
-        file_metadata = {"name": post_id, "parents": [DRIVE_FOLDER_ID]}
-        media = MediaIoBaseUpload(img_stream, mimetype="image/jpeg")
-        drive_service.files().create(body=file_metadata, media_body=media, fields="id").execute()
+        # Upload to Google Drive folder
+        file_metadata = {
+            "name":    f"{post_id}.jpg",
+            "parents": [DRIVE_FOLDER_ID]
+        }
+        media = MediaIoBaseUpload(img_stream, mimetype="image/jpeg", resumable=True)
+        file  = drive_service.files().create(
+            body=file_metadata,
+            media_body=media,
+            fields="id, name"
+        ).execute()
+
+        print(f"Image saved to Drive: {file.get('name')} (ID: {file.get('id')})")
 
     except Exception as e:
+        import traceback
         print(f"Drive upload error: {e}")
+        print(traceback.format_exc())
 
 
 # ============================================
@@ -436,7 +436,7 @@ def save_to_sheet(message_id, c2, likes, reached):
         rows  = sheet.get_all_values()
 
         if len(rows) == 0:
-            sheet.append_row(["Message ID", "Date Added", "C2 Text", "Likes", "Reached", "Platform"])
+            sheet.append_row(["Message ID", "Date Added", "C2 Text", "Reactions", "Reached", "Platform"])
             rows = sheet.get_all_values()
 
         for row in rows[1:]:
