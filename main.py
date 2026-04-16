@@ -55,12 +55,13 @@ def get_sheets_client():
 
 # ============================================
 # EVERY 5 MINUTES JOB
-# 1. Fetch new photo posts — skip if ID already
-#    exists in Sheet1 or testing C2
-# 2. Update reactions for all posts in testing C2
-# 3. Update reactions for all posts in Sheet1
-# 4. Check winners → move to Sheet1 + Drive
-# 5. Delete posts older than 7 days
+# testing C2 columns:
+#   Content ID | Date & Time Posted | C2 Text
+#   | Reactions | Reached | Image URL
+#
+# Sheet1 columns:
+#   Message ID | Date Added | C2 Text
+#   | Reactions | Reached | Platform | Drive Link
 # ============================================
 @app.route("/poll-posts", methods=["GET"])
 def poll_posts():
@@ -74,15 +75,21 @@ def poll_posts():
 
         # Add header if testing C2 is empty
         if len(rows) == 0:
-            sheet.append_row(["Content ID", "Date & Time Posted", "C2 Text", "Reactions", "Reached"])
+            sheet.append_row([
+                "Content ID", "Date & Time Posted",
+                "C2 Text", "Reactions", "Reached", "Image URL"
+            ])
             rows = sheet.get_all_values()
 
         # Add header if Sheet1 is empty
         if len(rows1) == 0:
-            sheet1.append_row(["Message ID", "Date Added", "C2 Text", "Reactions", "Reached", "Platform"])
+            sheet1.append_row([
+                "Message ID", "Date Added", "C2 Text",
+                "Reactions", "Reached", "Platform", "Drive Link"
+            ])
             rows1 = sheet1.get_all_values()
 
-        # Get all existing IDs from BOTH sheets
+        # Get all existing IDs from both sheets
         testing_ids = set()
         for row in rows[1:]:
             if row:
@@ -93,16 +100,15 @@ def poll_posts():
             if row:
                 sheet1_ids.add(str(row[0]).strip())
 
-        # All known IDs — used to skip duplicates
         all_known_ids = testing_ids | sheet1_ids
 
         # ----------------------------------------
         # STEP 1 — Fetch new photo posts from FB
-        # Skip if ID already exists in any sheet
+        # Save image URL immediately when detected
         # ----------------------------------------
         url = (
             f"https://graph.facebook.com/{FB_PAGE_ID}/posts"
-            f"?fields=id,message,created_time,attachments"
+            f"?fields=id,message,created_time,attachments,full_picture"
             f"&limit=10"
             f"&access_token={FB_PAGE_TOKEN}"
         )
@@ -114,14 +120,18 @@ def poll_posts():
             message      = post.get("message", "")
             created_time = post.get("created_time", "")
             attachments  = post.get("attachments", {}).get("data", [])
+            image_url    = post.get("full_picture", "")
 
-            # Skip if ID already exists in Sheet1 or testing C2
             if post_id in all_known_ids:
                 continue
 
             has_photo = any(a.get("type") in ["photo", "album"] for a in attachments)
             if not has_photo:
                 continue
+
+            # If full_picture not in post, fetch it separately
+            if not image_url:
+                image_url = get_post_image_url(post_id)
 
             try:
                 utc_time = datetime.strptime(created_time, "%Y-%m-%dT%H:%M:%S+0000")
@@ -138,7 +148,8 @@ def poll_posts():
                 formatted_date,
                 c2_text,
                 f"{reactions:,}",
-                f"{reached:,}"
+                f"{reached:,}",
+                image_url
             ])
             all_known_ids.add(post_id)
             testing_ids.add(post_id)
@@ -170,12 +181,18 @@ def poll_posts():
             post_id    = row[0].strip()
             created_at = row[1].strip()
             c2_text    = row[2].strip()
+            image_url  = row[5] if len(row) > 5 else ""
 
             reactions, reached = get_post_stats(post_id)
 
-            # Write comma-formatted numbers
             sheet.update_cell(i, 4, f"{reactions:,}")
             sheet.update_cell(i, 5, f"{reached:,}")
+
+            # If image URL is missing, try to fetch it
+            if not image_url:
+                image_url = get_post_image_url(post_id)
+                if image_url:
+                    sheet.update_cell(i, 6, image_url)
 
             # Check post age
             try:
@@ -189,20 +206,21 @@ def poll_posts():
 
             # Winner — reactions >= 10,000
             if reactions >= LIKES_THRESHOLD:
-                # Save to Sheet1 only if not already there
                 if post_id not in sheet1_ids:
+                    # Upload image to Google Drive
+                    drive_link = save_image_to_drive(post_id, image_url, drive_service)
+
+                    # Save to Sheet1 with Drive link
                     sheet1.append_row([
                         post_id,
                         now.strftime("%m/%d/%Y"),
                         c2_text,
                         f"{reactions:,}",
                         f"{reached:,}",
-                        "Facebook"
+                        "Facebook",
+                        drive_link
                     ])
                     sheet1_ids.add(post_id)
-
-                    # Save image to Google Drive
-                    save_image_to_drive(post_id, drive_service)
 
                     # Notify admin
                     notify(
@@ -210,8 +228,8 @@ def poll_posts():
                         f"📝 \"{preview}\"\n"
                         f"❤️ Reactions: {reactions:,}\n"
                         f"👁️ Reached: {reached:,}\n\n"
-                        f"✅ Moved to Sheet1 (A-RR database)\n"
-                        f"🖼️ Image saved to Google Drive\n"
+                        f"✅ Moved to Sheet1\n"
+                        f"🖼️ Drive: {drive_link}\n"
                         f"🆔 ID: {post_id}"
                     )
 
@@ -228,7 +246,6 @@ def poll_posts():
                 )
                 rows_to_delete.append(i)
 
-        # Delete rows in reverse order
         for row_num in sorted(rows_to_delete, reverse=True):
             sheet.delete_rows(row_num)
 
@@ -239,6 +256,19 @@ def poll_posts():
         print(f"Poll error: {e}")
         print(traceback.format_exc())
         return f"Error: {e}", 500
+
+
+# ============================================
+# GET POST IMAGE URL FROM FACEBOOK
+# Fetches the full_picture URL for a post.
+# ============================================
+def get_post_image_url(post_id):
+    try:
+        url    = f"https://graph.facebook.com/{post_id}?fields=full_picture&access_token={FB_PAGE_TOKEN}"
+        result = requests.get(url).json()
+        return result.get("full_picture", "")
+    except:
+        return ""
 
 
 # ============================================
@@ -267,21 +297,24 @@ def get_post_stats(post_id):
 
 # ============================================
 # SAVE IMAGE TO GOOGLE DRIVE
-# Downloads post image and uploads to Drive folder.
+# Uses stored image URL from testing C2.
+# Returns the Google Drive shareable link.
 # ============================================
-def save_image_to_drive(post_id, drive_service):
+def save_image_to_drive(post_id, image_url, drive_service):
     try:
-        url       = f"https://graph.facebook.com/{post_id}?fields=full_picture&access_token={FB_PAGE_TOKEN}"
-        result    = requests.get(url).json()
-        image_url = result.get("full_picture")
+        if not image_url:
+            image_url = get_post_image_url(post_id)
 
         if not image_url:
-            print(f"No image found for post {post_id}")
-            return
+            print(f"No image URL for post {post_id}")
+            return "No image"
 
-        img_data   = requests.get(image_url).content
-        img_stream = io.BytesIO(img_data)
+        # Download image
+        img_response = requests.get(image_url, timeout=30)
+        img_response.raise_for_status()
+        img_stream = io.BytesIO(img_response.content)
 
+        # Upload to Google Drive
         file_metadata = {
             "name":    f"{post_id}.jpg",
             "parents": [DRIVE_FOLDER_ID]
@@ -290,15 +323,20 @@ def save_image_to_drive(post_id, drive_service):
         file  = drive_service.files().create(
             body=file_metadata,
             media_body=media,
-            fields="id, name"
+            fields="id, name, webViewLink"
         ).execute()
 
-        print(f"Image saved to Drive: {file.get('name')}")
+        file_id    = file.get("id", "")
+        drive_link = f"https://drive.google.com/file/d/{file_id}/view"
+
+        print(f"Image saved to Drive: {post_id}.jpg — {drive_link}")
+        return drive_link
 
     except Exception as e:
         import traceback
         print(f"Drive upload error: {e}")
         print(traceback.format_exc())
+        return "Upload failed"
 
 
 # ============================================
@@ -460,7 +498,10 @@ def save_to_sheet(message_id, c2, likes, reached):
         rows  = sheet.get_all_values()
 
         if len(rows) == 0:
-            sheet.append_row(["Message ID", "Date Added", "C2 Text", "Reactions", "Reached", "Platform"])
+            sheet.append_row([
+                "Message ID", "Date Added", "C2 Text",
+                "Reactions", "Reached", "Platform", "Drive Link"
+            ])
             rows = sheet.get_all_values()
 
         for row in rows[1:]:
@@ -473,7 +514,11 @@ def save_to_sheet(message_id, c2, likes, reached):
                 str(row[4]).strip() == reached):
                 return "duplicate"
 
-        sheet.append_row([message_id, datetime.now().strftime("%m/%d/%Y"), c2, likes, reached, "Facebook"])
+        sheet.append_row([
+            message_id,
+            datetime.now().strftime("%m/%d/%Y"),
+            c2, likes, reached, "Facebook", ""
+        ])
         return "saved"
 
     except Exception as e:
