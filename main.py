@@ -3,11 +3,8 @@ import json
 import requests
 from flask import Flask, request, jsonify, redirect
 from google.oauth2.service_account import Credentials
-from googleapiclient.discovery import build
-from googleapiclient.http import MediaIoBaseUpload
 import gspread
 from datetime import datetime, timezone, timedelta
-import io
 
 app = Flask(__name__)
 
@@ -27,7 +24,6 @@ FB_PAGE_ID      = os.environ.get("FB_PAGE_ID")
 IG_ACCOUNT_ID   = os.environ.get("IG_ACCOUNT_ID")
 THREADS_TOKEN   = os.environ.get("THREADS_TOKEN")
 THREADS_USER_ID = os.environ.get("THREADS_USER_ID")
-DRIVE_FOLDER_ID = "1mCEdx7wAxbUGBkAmtgy6XTEbBDtGqDl4"
 LIKES_THRESHOLD    = 10000
 DAYS_BEFORE_DELETE = 7
 
@@ -42,10 +38,7 @@ TELEGRAM_API = f"https://api.telegram.org/bot{BOT_TOKEN}"
 def get_google_creds():
     creds_json = os.environ.get("GOOGLE_CREDS")
     creds_dict = json.loads(creds_json)
-    scopes     = [
-        "https://www.googleapis.com/auth/spreadsheets",
-        "https://www.googleapis.com/auth/drive"
-    ]
+    scopes     = ["https://www.googleapis.com/auth/spreadsheets"]
     return Credentials.from_service_account_info(creds_dict, scopes=scopes)
 
 
@@ -55,23 +48,23 @@ def get_sheets_client():
 
 # ============================================
 # EVERY 5 MINUTES JOB
+#
 # testing C2 columns:
 #   Content ID | Date & Time Posted | C2 Text
 #   | Reactions | Reached | Image URL
 #
 # Sheet1 columns:
 #   Message ID | Date Added | C2 Text
-#   | Reactions | Reached | Platform | Drive Link
+#   | Reactions | Reached | Platform | Image URL
 # ============================================
 @app.route("/poll-posts", methods=["GET"])
 def poll_posts():
     try:
-        gc            = get_sheets_client()
-        sheet         = gc.open_by_key(SHEET_ID).worksheet(TESTING_SHEET)
-        sheet1        = gc.open_by_key(SHEET_ID).worksheet(SHEET_NAME)
-        rows          = sheet.get_all_values()
-        rows1         = sheet1.get_all_values()
-        drive_service = build("drive", "v3", credentials=get_google_creds())
+        gc     = get_sheets_client()
+        sheet  = gc.open_by_key(SHEET_ID).worksheet(TESTING_SHEET)
+        sheet1 = gc.open_by_key(SHEET_ID).worksheet(SHEET_NAME)
+        rows   = sheet.get_all_values()
+        rows1  = sheet1.get_all_values()
 
         # Add header if testing C2 is empty
         if len(rows) == 0:
@@ -85,7 +78,7 @@ def poll_posts():
         if len(rows1) == 0:
             sheet1.append_row([
                 "Message ID", "Date Added", "C2 Text",
-                "Reactions", "Reached", "Platform", "Drive Link"
+                "Reactions", "Reached", "Platform", "Image URL"
             ])
             rows1 = sheet1.get_all_values()
 
@@ -129,7 +122,7 @@ def poll_posts():
             if not has_photo:
                 continue
 
-            # If full_picture not in post, fetch it separately
+            # If image URL not in post response, fetch separately
             if not image_url:
                 image_url = get_post_image_url(post_id)
 
@@ -170,7 +163,7 @@ def poll_posts():
         # STEP 3 — Update reactions in testing C2
         # Check winners and delete old losers
         # ----------------------------------------
-        rows          = sheet.get_all_values()
+        rows           = sheet.get_all_values()
         rows_to_delete = []
         now            = datetime.now(PH_TZ)
 
@@ -188,7 +181,7 @@ def poll_posts():
             sheet.update_cell(i, 4, f"{reactions:,}")
             sheet.update_cell(i, 5, f"{reached:,}")
 
-            # If image URL is missing, try to fetch it
+            # If image URL is still missing, try again
             if not image_url:
                 image_url = get_post_image_url(post_id)
                 if image_url:
@@ -207,10 +200,7 @@ def poll_posts():
             # Winner — reactions >= 10,000
             if reactions >= LIKES_THRESHOLD:
                 if post_id not in sheet1_ids:
-                    # Upload image to Google Drive
-                    drive_link = save_image_to_drive(post_id, image_url, drive_service)
-
-                    # Save to Sheet1 with Drive link
+                    # Save to Sheet1 with image URL — no Drive upload
                     sheet1.append_row([
                         post_id,
                         now.strftime("%m/%d/%Y"),
@@ -218,7 +208,7 @@ def poll_posts():
                         f"{reactions:,}",
                         f"{reached:,}",
                         "Facebook",
-                        drive_link
+                        image_url
                     ])
                     sheet1_ids.add(post_id)
 
@@ -229,7 +219,7 @@ def poll_posts():
                         f"❤️ Reactions: {reactions:,}\n"
                         f"👁️ Reached: {reached:,}\n\n"
                         f"✅ Moved to Sheet1\n"
-                        f"🖼️ Drive: {drive_link}\n"
+                        f"🖼️ Image URL saved\n"
                         f"🆔 ID: {post_id}"
                     )
 
@@ -260,7 +250,6 @@ def poll_posts():
 
 # ============================================
 # GET POST IMAGE URL FROM FACEBOOK
-# Fetches the full_picture URL for a post.
 # ============================================
 def get_post_image_url(post_id):
     try:
@@ -290,53 +279,8 @@ def get_post_stats(post_id):
             if insight.get("name") == "post_impressions_unique":
                 reached = insight.get("values", [{}])[-1].get("value", 0)
         return reactions, reached
-    except Exception as e:
-        print(f"Post stats error: {e}")
+    except:
         return 0, 0
-
-
-# ============================================
-# SAVE IMAGE TO GOOGLE DRIVE
-# Uses stored image URL from testing C2.
-# Returns the Google Drive shareable link.
-# ============================================
-def save_image_to_drive(post_id, image_url, drive_service):
-    try:
-        if not image_url:
-            image_url = get_post_image_url(post_id)
-
-        if not image_url:
-            print(f"No image URL for post {post_id}")
-            return "No image"
-
-        # Download image
-        img_response = requests.get(image_url, timeout=30)
-        img_response.raise_for_status()
-        img_stream = io.BytesIO(img_response.content)
-
-        # Upload to Google Drive
-        file_metadata = {
-            "name":    f"{post_id}.jpg",
-            "parents": [DRIVE_FOLDER_ID]
-        }
-        media = MediaIoBaseUpload(img_stream, mimetype="image/jpeg", resumable=True)
-        file  = drive_service.files().create(
-            body=file_metadata,
-            media_body=media,
-            fields="id, name, webViewLink"
-        ).execute()
-
-        file_id    = file.get("id", "")
-        drive_link = f"https://drive.google.com/file/d/{file_id}/view"
-
-        print(f"Image saved to Drive: {post_id}.jpg — {drive_link}")
-        return drive_link
-
-    except Exception as e:
-        import traceback
-        print(f"Drive upload error: {e}")
-        print(traceback.format_exc())
-        return "Upload failed"
 
 
 # ============================================
@@ -500,7 +444,7 @@ def save_to_sheet(message_id, c2, likes, reached):
         if len(rows) == 0:
             sheet.append_row([
                 "Message ID", "Date Added", "C2 Text",
-                "Reactions", "Reached", "Platform", "Drive Link"
+                "Reactions", "Reached", "Platform", "Image URL"
             ])
             rows = sheet.get_all_values()
 
