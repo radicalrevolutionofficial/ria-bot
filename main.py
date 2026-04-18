@@ -51,11 +51,11 @@ def get_sheets_client():
 #
 # testing C2 columns:
 #   Content ID | Date & Time Posted | C2 Text
-#   | Reactions | Reached | Image URL
+#   | Reactions | Image URL
 #
 # Sheet1 columns:
 #   Message ID | Date Added | C2 Text
-#   | Reactions | Reached | Platform | Image URL
+#   | Reactions | Image URL
 # ============================================
 @app.route("/poll-posts", methods=["GET"])
 def poll_posts():
@@ -70,15 +70,15 @@ def poll_posts():
         if len(rows) == 0:
             sheet.append_row([
                 "Content ID", "Date & Time Posted",
-                "C2 Text", "Reactions", "Reached", "Image URL"
+                "C2 Text", "Reactions", "Image URL"
             ])
             rows = sheet.get_all_values()
 
         # Add header if Sheet1 is empty
         if len(rows1) == 0:
             sheet1.append_row([
-                "Message ID", "Date Added", "C2 Text",
-                "Reactions", "Reached", "Platform", "Image URL"
+                "Message ID", "Date Added",
+                "C2 Text", "Reactions", "Image URL"
             ])
             rows1 = sheet1.get_all_values()
 
@@ -97,7 +97,6 @@ def poll_posts():
 
         # ----------------------------------------
         # STEP 1 — Fetch new photo posts from FB
-        # Save image URL immediately when detected
         # ----------------------------------------
         url = (
             f"https://graph.facebook.com/{FB_PAGE_ID}/posts"
@@ -122,7 +121,6 @@ def poll_posts():
             if not has_photo:
                 continue
 
-            # If image URL not in post response, fetch separately
             if not image_url:
                 image_url = get_post_image_url(post_id)
 
@@ -133,15 +131,14 @@ def poll_posts():
             except:
                 formatted_date = datetime.now(PH_TZ).strftime("%m/%d/%Y %I:%M %p")
 
-            c2_text            = message.split("\n")[0].strip()
-            reactions, reached = get_post_stats(post_id)
+            c2_text   = message.split("\n")[0].strip()
+            reactions = get_post_reactions(post_id)
 
             sheet.append_row([
                 post_id,
                 formatted_date,
                 c2_text,
                 f"{reactions:,}",
-                f"{reached:,}",
                 image_url
             ])
             all_known_ids.add(post_id)
@@ -154,10 +151,9 @@ def poll_posts():
         for i, row in enumerate(rows1[1:], start=2):
             if len(row) < 1 or not row[0].strip():
                 continue
-            post_id = row[0].strip()
-            reactions, reached = get_post_stats(post_id)
+            post_id   = row[0].strip()
+            reactions = get_post_reactions(post_id)
             sheet1.update_cell(i, 4, f"{reactions:,}")
-            sheet1.update_cell(i, 5, f"{reached:,}")
 
         # ----------------------------------------
         # STEP 3 — Update reactions in testing C2
@@ -168,24 +164,22 @@ def poll_posts():
         now            = datetime.now(PH_TZ)
 
         for i, row in enumerate(rows[1:], start=2):
-            if len(row) < 5 or not row[0].strip():
+            if len(row) < 4 or not row[0].strip():
                 continue
 
             post_id    = row[0].strip()
             created_at = row[1].strip()
             c2_text    = row[2].strip()
-            image_url  = row[5] if len(row) > 5 else ""
+            image_url  = row[4] if len(row) > 4 else ""
 
-            reactions, reached = get_post_stats(post_id)
-
+            reactions = get_post_reactions(post_id)
             sheet.update_cell(i, 4, f"{reactions:,}")
-            sheet.update_cell(i, 5, f"{reached:,}")
 
-            # If image URL is still missing, try again
+            # If image URL is missing, try to fetch it
             if not image_url:
                 image_url = get_post_image_url(post_id)
                 if image_url:
-                    sheet.update_cell(i, 6, image_url)
+                    sheet.update_cell(i, 5, image_url)
 
             # Check post age
             try:
@@ -200,24 +194,19 @@ def poll_posts():
             # Winner — reactions >= 10,000
             if reactions >= LIKES_THRESHOLD:
                 if post_id not in sheet1_ids:
-                    # Save to Sheet1 with image URL — no Drive upload
                     sheet1.append_row([
                         post_id,
                         now.strftime("%m/%d/%Y"),
                         c2_text,
                         f"{reactions:,}",
-                        f"{reached:,}",
-                        "Facebook",
                         image_url
                     ])
                     sheet1_ids.add(post_id)
 
-                    # Notify admin
                     notify(
                         f"🏆 A-RR Winner!\n\n"
                         f"📝 \"{preview}\"\n"
-                        f"❤️ Reactions: {reactions:,}\n"
-                        f"👁️ Reached: {reached:,}\n\n"
+                        f"❤️ Reactions: {reactions:,}\n\n"
                         f"✅ Moved to Sheet1\n"
                         f"🖼️ Image URL saved\n"
                         f"🆔 ID: {post_id}"
@@ -249,6 +238,23 @@ def poll_posts():
 
 
 # ============================================
+# GET POST REACTIONS FROM FACEBOOK
+# Returns total reactions (all types).
+# ============================================
+def get_post_reactions(post_id):
+    try:
+        url = (
+            f"https://graph.facebook.com/{post_id}"
+            f"?fields=reactions.summary(true)"
+            f"&access_token={FB_PAGE_TOKEN}"
+        )
+        result = requests.get(url).json()
+        return result.get("reactions", {}).get("summary", {}).get("total_count", 0)
+    except:
+        return 0
+
+
+# ============================================
 # GET POST IMAGE URL FROM FACEBOOK
 # ============================================
 def get_post_image_url(post_id):
@@ -258,29 +264,6 @@ def get_post_image_url(post_id):
         return result.get("full_picture", "")
     except:
         return ""
-
-
-# ============================================
-# GET POST STATS FROM FACEBOOK
-# Returns total reactions (all types) and reached.
-# ============================================
-def get_post_stats(post_id):
-    try:
-        url = (
-            f"https://graph.facebook.com/{post_id}"
-            f"?fields=reactions.summary(true),insights.metric(post_impressions_unique)"
-            f"&access_token={FB_PAGE_TOKEN}"
-        )
-        result    = requests.get(url).json()
-        reactions = result.get("reactions", {}).get("summary", {}).get("total_count", 0)
-        reached   = 0
-        insights  = result.get("insights", {}).get("data", [])
-        for insight in insights:
-            if insight.get("name") == "post_impressions_unique":
-                reached = insight.get("values", [{}])[-1].get("value", 0)
-        return reactions, reached
-    except:
-        return 0, 0
 
 
 # ============================================
@@ -443,8 +426,8 @@ def save_to_sheet(message_id, c2, likes, reached):
 
         if len(rows) == 0:
             sheet.append_row([
-                "Message ID", "Date Added", "C2 Text",
-                "Reactions", "Reached", "Platform", "Image URL"
+                "Message ID", "Date Added",
+                "C2 Text", "Reactions", "Image URL"
             ])
             rows = sheet.get_all_values()
 
@@ -454,14 +437,13 @@ def save_to_sheet(message_id, c2, likes, reached):
 
         for row in rows[1:]:
             if (str(row[2]).strip() == c2 and
-                str(row[3]).strip() == likes and
-                str(row[4]).strip() == reached):
+                str(row[3]).strip() == likes):
                 return "duplicate"
 
         sheet.append_row([
             message_id,
             datetime.now().strftime("%m/%d/%Y"),
-            c2, likes, reached, "Facebook", ""
+            c2, likes, ""
         ])
         return "saved"
 
