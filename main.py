@@ -66,7 +66,6 @@ def poll_posts():
         rows   = sheet.get_all_values()
         rows1  = sheet1.get_all_values()
 
-        # Add header if testing C2 is empty
         if len(rows) == 0:
             sheet.append_row([
                 "Content ID", "Date & Time Posted",
@@ -74,7 +73,6 @@ def poll_posts():
             ])
             rows = sheet.get_all_values()
 
-        # Add header if Sheet1 is empty
         if len(rows1) == 0:
             sheet1.append_row([
                 "Message ID", "Date Added",
@@ -82,7 +80,6 @@ def poll_posts():
             ])
             rows1 = sheet1.get_all_values()
 
-        # Get all existing IDs from both sheets
         testing_ids = set()
         for row in rows[1:]:
             if row:
@@ -97,10 +94,12 @@ def poll_posts():
 
         # ----------------------------------------
         # STEP 1 — Fetch new photo posts from FB
+        # Uses high quality image from attachments
         # ----------------------------------------
         url = (
             f"https://graph.facebook.com/{FB_PAGE_ID}/posts"
-            f"?fields=id,message,created_time,attachments,full_picture"
+            f"?fields=id,message,created_time,"
+            f"attachments{{media{{image{{src,width,height}}}},type}}"
             f"&limit=10"
             f"&access_token={FB_PAGE_TOKEN}"
         )
@@ -112,7 +111,6 @@ def poll_posts():
             message      = post.get("message", "")
             created_time = post.get("created_time", "")
             attachments  = post.get("attachments", {}).get("data", [])
-            image_url    = post.get("full_picture", "")
 
             if post_id in all_known_ids:
                 continue
@@ -121,8 +119,8 @@ def poll_posts():
             if not has_photo:
                 continue
 
-            if not image_url:
-                image_url = get_post_image_url(post_id)
+            # Get highest quality image from attachments
+            image_url = get_hq_image_url(attachments, post_id)
 
             try:
                 utc_time = datetime.strptime(created_time, "%Y-%m-%dT%H:%M:%S+0000")
@@ -175,13 +173,12 @@ def poll_posts():
             reactions = get_post_reactions(post_id)
             sheet.update_cell(i, 4, f"{reactions:,}")
 
-            # If image URL is missing, try to fetch it
+            # If image URL is missing, try to fetch HQ version
             if not image_url:
-                image_url = get_post_image_url(post_id)
+                image_url = get_post_image_url_hq(post_id)
                 if image_url:
                     sheet.update_cell(i, 5, image_url)
 
-            # Check post age
             try:
                 post_date = datetime.strptime(created_at, "%m/%d/%Y %I:%M %p")
                 post_date = post_date.replace(tzinfo=PH_TZ)
@@ -238,6 +235,53 @@ def poll_posts():
 
 
 # ============================================
+# GET HIGH QUALITY IMAGE URL FROM ATTACHMENTS
+# Extracts highest resolution image from post
+# attachments data already fetched.
+# ============================================
+def get_hq_image_url(attachments, post_id):
+    try:
+        for attachment in attachments:
+            media = attachment.get("media", {})
+            image = media.get("image", {})
+            src   = image.get("src", "")
+            if src:
+                return src
+        # Fallback to separate API call
+        return get_post_image_url_hq(post_id)
+    except:
+        return get_post_image_url_hq(post_id)
+
+
+# ============================================
+# GET HIGH QUALITY IMAGE URL — SEPARATE CALL
+# Fetches highest resolution image via API.
+# Uses attachments field for best quality.
+# ============================================
+def get_post_image_url_hq(post_id):
+    try:
+        url    = (
+            f"https://graph.facebook.com/{post_id}"
+            f"?fields=attachments{{media{{image{{src,width,height}}}}}}"
+            f"&access_token={FB_PAGE_TOKEN}"
+        )
+        result      = requests.get(url).json()
+        attachments = result.get("attachments", {}).get("data", [])
+        for attachment in attachments:
+            media = attachment.get("media", {})
+            image = media.get("image", {})
+            src   = image.get("src", "")
+            if src:
+                return src
+        # Final fallback to full_picture
+        url2    = f"https://graph.facebook.com/{post_id}?fields=full_picture&access_token={FB_PAGE_TOKEN}"
+        result2 = requests.get(url2).json()
+        return result2.get("full_picture", "")
+    except:
+        return ""
+
+
+# ============================================
 # GET POST REACTIONS FROM FACEBOOK
 # Returns total reactions (all types).
 # ============================================
@@ -252,18 +296,6 @@ def get_post_reactions(post_id):
         return result.get("reactions", {}).get("summary", {}).get("total_count", 0)
     except:
         return 0
-
-
-# ============================================
-# GET POST IMAGE URL FROM FACEBOOK
-# ============================================
-def get_post_image_url(post_id):
-    try:
-        url    = f"https://graph.facebook.com/{post_id}?fields=full_picture&access_token={FB_PAGE_TOKEN}"
-        result = requests.get(url).json()
-        return result.get("full_picture", "")
-    except:
-        return ""
 
 
 # ============================================
