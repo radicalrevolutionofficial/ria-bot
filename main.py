@@ -51,11 +51,11 @@ def get_sheets_client():
 #
 # testing C2 columns:
 #   Content ID | Date & Time Posted | C2 Text
-#   | Reactions | Image URL
+#   | Reactions | Comments | Shares | Image URL
 #
 # Sheet1 columns:
 #   Message ID | Date Added | C2 Text
-#   | Reactions | Image URL
+#   | Reactions | Comments | Shares | Image URL
 # ============================================
 @app.route("/poll-posts", methods=["GET"])
 def poll_posts():
@@ -68,15 +68,15 @@ def poll_posts():
 
         if len(rows) == 0:
             sheet.append_row([
-                "Content ID", "Date & Time Posted",
-                "C2 Text", "Reactions", "Image URL"
+                "Content ID", "Date & Time Posted", "C2 Text",
+                "Reactions", "Comments", "Shares", "Image URL"
             ])
             rows = sheet.get_all_values()
 
         if len(rows1) == 0:
             sheet1.append_row([
-                "Message ID", "Date Added",
-                "C2 Text", "Reactions", "Image URL"
+                "Message ID", "Date Added", "C2 Text",
+                "Reactions", "Comments", "Shares", "Image URL"
             ])
             rows1 = sheet1.get_all_values()
 
@@ -94,7 +94,6 @@ def poll_posts():
 
         # ----------------------------------------
         # STEP 1 — Fetch new photo posts from FB
-        # Uses high quality image from attachments
         # ----------------------------------------
         url = (
             f"https://graph.facebook.com/{FB_PAGE_ID}/posts"
@@ -119,7 +118,6 @@ def poll_posts():
             if not has_photo:
                 continue
 
-            # Get highest quality image from attachments
             image_url = get_hq_image_url(attachments, post_id)
 
             try:
@@ -129,32 +127,36 @@ def poll_posts():
             except:
                 formatted_date = datetime.now(PH_TZ).strftime("%m/%d/%Y %I:%M %p")
 
-            c2_text   = message.split("\n")[0].strip()
-            reactions = get_post_reactions(post_id)
+            c2_text                    = message.split("\n")[0].strip()
+            reactions, comments, shares = get_post_stats(post_id)
 
             sheet.append_row([
                 post_id,
                 formatted_date,
                 c2_text,
                 f"{reactions:,}",
+                f"{comments:,}",
+                f"{shares:,}",
                 image_url
             ])
             all_known_ids.add(post_id)
             testing_ids.add(post_id)
 
         # ----------------------------------------
-        # STEP 2 — Update reactions in Sheet1
+        # STEP 2 — Update stats in Sheet1
         # ----------------------------------------
         rows1 = sheet1.get_all_values()
         for i, row in enumerate(rows1[1:], start=2):
             if len(row) < 1 or not row[0].strip():
                 continue
-            post_id   = row[0].strip()
-            reactions = get_post_reactions(post_id)
+            post_id                    = row[0].strip()
+            reactions, comments, shares = get_post_stats(post_id)
             sheet1.update_cell(i, 4, f"{reactions:,}")
+            sheet1.update_cell(i, 5, f"{comments:,}")
+            sheet1.update_cell(i, 6, f"{shares:,}")
 
         # ----------------------------------------
-        # STEP 3 — Update reactions in testing C2
+        # STEP 3 — Update stats in testing C2
         # Check winners and delete old losers
         # ----------------------------------------
         rows           = sheet.get_all_values()
@@ -168,16 +170,17 @@ def poll_posts():
             post_id    = row[0].strip()
             created_at = row[1].strip()
             c2_text    = row[2].strip()
-            image_url  = row[4] if len(row) > 4 else ""
+            image_url  = row[6] if len(row) > 6 else ""
 
-            reactions = get_post_reactions(post_id)
+            reactions, comments, shares = get_post_stats(post_id)
             sheet.update_cell(i, 4, f"{reactions:,}")
+            sheet.update_cell(i, 5, f"{comments:,}")
+            sheet.update_cell(i, 6, f"{shares:,}")
 
-            # If image URL is missing, try to fetch HQ version
             if not image_url:
                 image_url = get_post_image_url_hq(post_id)
                 if image_url:
-                    sheet.update_cell(i, 5, image_url)
+                    sheet.update_cell(i, 7, image_url)
 
             try:
                 post_date = datetime.strptime(created_at, "%m/%d/%Y %I:%M %p")
@@ -196,6 +199,8 @@ def poll_posts():
                         now.strftime("%m/%d/%Y"),
                         c2_text,
                         f"{reactions:,}",
+                        f"{comments:,}",
+                        f"{shares:,}",
                         image_url
                     ])
                     sheet1_ids.add(post_id)
@@ -203,7 +208,9 @@ def poll_posts():
                     notify(
                         f"🏆 A-RR Winner!\n\n"
                         f"📝 \"{preview}\"\n"
-                        f"❤️ Reactions: {reactions:,}\n\n"
+                        f"❤️ Reactions: {reactions:,}\n"
+                        f"💬 Comments: {comments:,}\n"
+                        f"🔁 Shares: {shares:,}\n\n"
                         f"✅ Moved to Sheet1\n"
                         f"🖼️ Image URL saved\n"
                         f"🆔 ID: {post_id}"
@@ -235,9 +242,27 @@ def poll_posts():
 
 
 # ============================================
+# GET POST STATS FROM FACEBOOK
+# Returns reactions, comments, and shares.
+# ============================================
+def get_post_stats(post_id):
+    try:
+        url = (
+            f"https://graph.facebook.com/{post_id}"
+            f"?fields=reactions.summary(true),comments.summary(true),shares"
+            f"&access_token={FB_PAGE_TOKEN}"
+        )
+        result    = requests.get(url).json()
+        reactions = result.get("reactions", {}).get("summary", {}).get("total_count", 0)
+        comments  = result.get("comments", {}).get("summary", {}).get("total_count", 0)
+        shares    = result.get("shares", {}).get("count", 0)
+        return reactions, comments, shares
+    except:
+        return 0, 0, 0
+
+
+# ============================================
 # GET HIGH QUALITY IMAGE URL FROM ATTACHMENTS
-# Extracts highest resolution image from post
-# attachments data already fetched.
 # ============================================
 def get_hq_image_url(attachments, post_id):
     try:
@@ -247,7 +272,6 @@ def get_hq_image_url(attachments, post_id):
             src   = image.get("src", "")
             if src:
                 return src
-        # Fallback to separate API call
         return get_post_image_url_hq(post_id)
     except:
         return get_post_image_url_hq(post_id)
@@ -255,8 +279,6 @@ def get_hq_image_url(attachments, post_id):
 
 # ============================================
 # GET HIGH QUALITY IMAGE URL — SEPARATE CALL
-# Fetches highest resolution image via API.
-# Uses attachments field for best quality.
 # ============================================
 def get_post_image_url_hq(post_id):
     try:
@@ -273,29 +295,11 @@ def get_post_image_url_hq(post_id):
             src   = image.get("src", "")
             if src:
                 return src
-        # Final fallback to full_picture
         url2    = f"https://graph.facebook.com/{post_id}?fields=full_picture&access_token={FB_PAGE_TOKEN}"
         result2 = requests.get(url2).json()
         return result2.get("full_picture", "")
     except:
         return ""
-
-
-# ============================================
-# GET POST REACTIONS FROM FACEBOOK
-# Returns total reactions (all types).
-# ============================================
-def get_post_reactions(post_id):
-    try:
-        url = (
-            f"https://graph.facebook.com/{post_id}"
-            f"?fields=reactions.summary(true)"
-            f"&access_token={FB_PAGE_TOKEN}"
-        )
-        result = requests.get(url).json()
-        return result.get("reactions", {}).get("summary", {}).get("total_count", 0)
-    except:
-        return 0
 
 
 # ============================================
@@ -458,8 +462,8 @@ def save_to_sheet(message_id, c2, likes, reached):
 
         if len(rows) == 0:
             sheet.append_row([
-                "Message ID", "Date Added",
-                "C2 Text", "Reactions", "Image URL"
+                "Message ID", "Date Added", "C2 Text",
+                "Reactions", "Comments", "Shares", "Image URL"
             ])
             rows = sheet.get_all_values()
 
@@ -475,7 +479,7 @@ def save_to_sheet(message_id, c2, likes, reached):
         sheet.append_row([
             message_id,
             datetime.now().strftime("%m/%d/%Y"),
-            c2, likes, ""
+            c2, likes, "", "", ""
         ])
         return "saved"
 
