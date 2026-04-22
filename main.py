@@ -127,17 +127,12 @@ def poll_posts():
             except:
                 formatted_date = datetime.now(PH_TZ).strftime("%m/%d/%Y %I:%M %p")
 
-            c2_text                    = message.split("\n")[0].strip()
+            c2_text                     = message.split("\n")[0].strip()
             reactions, comments, shares = get_post_stats(post_id)
 
             sheet.append_row([
-                post_id,
-                formatted_date,
-                c2_text,
-                f"{reactions:,}",
-                f"{comments:,}",
-                f"{shares:,}",
-                image_url
+                post_id, formatted_date, c2_text,
+                f"{reactions:,}", f"{comments:,}", f"{shares:,}", image_url
             ])
             all_known_ids.add(post_id)
             testing_ids.add(post_id)
@@ -149,7 +144,7 @@ def poll_posts():
         for i, row in enumerate(rows1[1:], start=2):
             if len(row) < 1 or not row[0].strip():
                 continue
-            post_id                    = row[0].strip()
+            post_id                     = row[0].strip()
             reactions, comments, shares = get_post_stats(post_id)
             sheet1.update_cell(i, 4, f"{reactions:,}")
             sheet1.update_cell(i, 5, f"{comments:,}")
@@ -157,13 +152,15 @@ def poll_posts():
 
         # ----------------------------------------
         # STEP 3 — Update stats in testing C2
-        # Check winners and delete old losers
         # ----------------------------------------
-        rows           = sheet.get_all_values()
-        rows_to_delete = []
-        now            = datetime.now(PH_TZ)
+        rows = sheet.get_all_values()
+        now  = datetime.now(PH_TZ)
 
-        for i, row in enumerate(rows[1:], start=2):
+        # Collect post IDs to delete BEFORE modifying sheet
+        ids_to_delete   = []
+        ids_to_sheet1   = []
+
+        for row in rows[1:]:
             if len(row) < 4 or not row[0].strip():
                 continue
 
@@ -173,15 +170,8 @@ def poll_posts():
             image_url  = row[6] if len(row) > 6 else ""
 
             reactions, comments, shares = get_post_stats(post_id)
-            sheet.update_cell(i, 4, f"{reactions:,}")
-            sheet.update_cell(i, 5, f"{comments:,}")
-            sheet.update_cell(i, 6, f"{shares:,}")
 
-            if not image_url:
-                image_url = get_post_image_url_hq(post_id)
-                if image_url:
-                    sheet.update_cell(i, 7, image_url)
-
+            # Check post age
             try:
                 post_date = datetime.strptime(created_at, "%m/%d/%Y %I:%M %p")
                 post_date = post_date.replace(tzinfo=PH_TZ)
@@ -191,32 +181,19 @@ def poll_posts():
 
             preview = c2_text[:60] + "..." if len(c2_text) > 60 else c2_text
 
-            # Winner — reactions >= 10,000
+            # Winner
             if reactions >= LIKES_THRESHOLD:
                 if post_id not in sheet1_ids:
-                    sheet1.append_row([
-                        post_id,
-                        now.strftime("%m/%d/%Y"),
-                        c2_text,
-                        f"{reactions:,}",
-                        f"{comments:,}",
-                        f"{shares:,}",
-                        image_url
-                    ])
-                    sheet1_ids.add(post_id)
-
-                    notify(
-                        f"🏆 A-RR Winner!\n\n"
-                        f"📝 \"{preview}\"\n"
-                        f"❤️ Reactions: {reactions:,}\n"
-                        f"💬 Comments: {comments:,}\n"
-                        f"🔁 Shares: {shares:,}\n\n"
-                        f"✅ Moved to Sheet1\n"
-                        f"🖼️ Image URL saved\n"
-                        f"🆔 ID: {post_id}"
-                    )
-
-                rows_to_delete.append(i)
+                    ids_to_sheet1.append({
+                        "post_id": post_id,
+                        "c2_text": c2_text,
+                        "reactions": reactions,
+                        "comments": comments,
+                        "shares": shares,
+                        "image_url": image_url,
+                        "preview": preview
+                    })
+                ids_to_delete.append(post_id)
 
             # Loser — older than 7 days
             elif age_days >= DAYS_BEFORE_DELETE:
@@ -227,10 +204,56 @@ def poll_posts():
                     f"❌ Did not reach {LIKES_THRESHOLD:,} reactions threshold\n"
                     f"🆔 ID: {post_id}"
                 )
-                rows_to_delete.append(i)
+                ids_to_delete.append(post_id)
 
-        for row_num in sorted(rows_to_delete, reverse=True):
-            sheet.delete_rows(row_num)
+        # Save winners to Sheet1
+        for winner in ids_to_sheet1:
+            sheet1.append_row([
+                winner["post_id"],
+                now.strftime("%m/%d/%Y"),
+                winner["c2_text"],
+                f"{winner['reactions']:,}",
+                f"{winner['comments']:,}",
+                f"{winner['shares']:,}",
+                winner["image_url"]
+            ])
+            sheet1_ids.add(winner["post_id"])
+            notify(
+                f"🏆 A-RR Winner!\n\n"
+                f"📝 \"{winner['preview']}\"\n"
+                f"❤️ Reactions: {winner['reactions']:,}\n"
+                f"💬 Comments: {winner['comments']:,}\n"
+                f"🔁 Shares: {winner['shares']:,}\n\n"
+                f"✅ Moved to Sheet1\n"
+                f"🖼️ Image URL saved\n"
+                f"🆔 ID: {winner['post_id']}"
+            )
+
+        # Update reactions for all posts in testing C2
+        rows = sheet.get_all_values()
+        for i, row in enumerate(rows[1:], start=2):
+            if len(row) < 1 or not row[0].strip():
+                continue
+            post_id                     = row[0].strip()
+            reactions, comments, shares = get_post_stats(post_id)
+            sheet.update_cell(i, 4, f"{reactions:,}")
+            sheet.update_cell(i, 5, f"{comments:,}")
+            sheet.update_cell(i, 6, f"{shares:,}")
+            image_url = row[6] if len(row) > 6 else ""
+            if not image_url:
+                img = get_post_image_url_hq(post_id)
+                if img:
+                    sheet.update_cell(i, 7, img)
+
+        # Delete rows — read fresh, delete from bottom up
+        if ids_to_delete:
+            rows = sheet.get_all_values()
+            rows_to_delete = []
+            for i, row in enumerate(rows[1:], start=2):
+                if row and str(row[0]).strip() in ids_to_delete:
+                    rows_to_delete.append(i)
+            for row_num in sorted(rows_to_delete, reverse=True):
+                sheet.delete_rows(row_num)
 
         return f"Done! Updated {len(rows)-1} posts.", 200
 
