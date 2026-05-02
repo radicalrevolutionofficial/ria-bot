@@ -47,15 +47,31 @@ def get_sheets_client():
 
 
 # ============================================
+# BUILD PERMANENT FACEBOOK POST LINK
+# Uses page ID and post ID to build a permanent
+# link that never expires.
+# ============================================
+def build_post_link(post_id):
+    # post_id format is "PAGE_ID_POST_ID"
+    # Extract just the post part after the underscore
+    try:
+        parts     = post_id.split("_")
+        post_part = parts[-1]
+        return f"https://www.facebook.com/{FB_PAGE_ID}/posts/{post_part}"
+    except:
+        return f"https://www.facebook.com/{FB_PAGE_ID}"
+
+
+# ============================================
 # EVERY 5 MINUTES JOB
 #
 # testing C2 columns:
 #   Content ID | Date & Time Posted | C2 Text
-#   | Reactions | Comments | Shares | Image URL
+#   | Reactions | Comments | Shares | Post Link
 #
 # Sheet1 columns:
 #   Message ID | Date & Time Added | C2 Text
-#   | Reactions | Comments | Shares | Image URL
+#   | Reactions | Comments | Shares | Post Link
 # ============================================
 @app.route("/poll-posts", methods=["GET"])
 def poll_posts():
@@ -69,14 +85,14 @@ def poll_posts():
         if len(rows) == 0:
             sheet.append_row([
                 "Content ID", "Date & Time Posted", "C2 Text",
-                "Reactions", "Comments", "Shares", "Image URL"
+                "Reactions", "Comments", "Shares", "Post Link"
             ])
             rows = sheet.get_all_values()
 
         if len(rows1) == 0:
             sheet1.append_row([
                 "Message ID", "Date & Time Added", "C2 Text",
-                "Reactions", "Comments", "Shares", "Image URL"
+                "Reactions", "Comments", "Shares", "Post Link"
             ])
             rows1 = sheet1.get_all_values()
 
@@ -118,7 +134,8 @@ def poll_posts():
             if not has_photo:
                 continue
 
-            image_url = get_hq_image_url(attachments, post_id)
+            # Build permanent post link instead of image URL
+            post_link = build_post_link(post_id)
 
             try:
                 utc_time = datetime.strptime(created_time, "%Y-%m-%dT%H:%M:%S+0000")
@@ -132,7 +149,7 @@ def poll_posts():
 
             sheet.append_row([
                 post_id, formatted_date, c2_text,
-                f"{reactions:,}", f"{comments:,}", f"{shares:,}", image_url
+                f"{reactions:,}", f"{comments:,}", f"{shares:,}", post_link
             ])
             all_known_ids.add(post_id)
             testing_ids.add(post_id)
@@ -166,7 +183,7 @@ def poll_posts():
             post_id    = row[0].strip()
             created_at = row[1].strip()
             c2_text    = row[2].strip()
-            image_url  = row[6] if len(row) > 6 else ""
+            post_link  = row[6] if len(row) > 6 else build_post_link(post_id)
 
             reactions, comments, shares = get_post_stats(post_id)
 
@@ -189,7 +206,7 @@ def poll_posts():
                         "reactions": reactions,
                         "comments":  comments,
                         "shares":    shares,
-                        "image_url": image_url,
+                        "post_link": post_link,
                         "preview":   preview
                     })
                 ids_to_delete.append(post_id)
@@ -201,11 +218,12 @@ def poll_posts():
                     f"📝 \"{preview}\"\n"
                     f"❤️ Only reached {reactions:,} reactions in {age_days} days\n"
                     f"❌ Did not reach {LIKES_THRESHOLD:,} reactions threshold\n"
+                    f"🔗 {post_link}\n"
                     f"🆔 ID: {post_id}"
                 )
                 ids_to_delete.append(post_id)
 
-        # Save winners to Sheet1 — use original posted_at date & time
+        # Save winners to Sheet1
         for winner in ids_to_sheet1:
             sheet1.append_row([
                 winner["post_id"],
@@ -214,7 +232,7 @@ def poll_posts():
                 f"{winner['reactions']:,}",
                 f"{winner['comments']:,}",
                 f"{winner['shares']:,}",
-                winner["image_url"]
+                winner["post_link"]
             ])
             sheet1_ids.add(winner["post_id"])
             notify(
@@ -224,7 +242,7 @@ def poll_posts():
                 f"💬 Comments: {winner['comments']:,}\n"
                 f"🔁 Shares: {winner['shares']:,}\n\n"
                 f"✅ Moved to Sheet1\n"
-                f"🖼️ Image URL saved\n"
+                f"🔗 {winner['post_link']}\n"
                 f"🆔 ID: {winner['post_id']}"
             )
 
@@ -238,11 +256,10 @@ def poll_posts():
             sheet.update_cell(i, 4, f"{reactions:,}")
             sheet.update_cell(i, 5, f"{comments:,}")
             sheet.update_cell(i, 6, f"{shares:,}")
-            image_url = row[6] if len(row) > 6 else ""
-            if not image_url:
-                img = get_post_image_url_hq(post_id)
-                if img:
-                    sheet.update_cell(i, 7, img)
+            # Fix missing post link
+            post_link = row[6] if len(row) > 6 else ""
+            if not post_link:
+                sheet.update_cell(i, 7, build_post_link(post_id))
 
         # Delete rows — read fresh, delete from bottom up
         if ids_to_delete:
@@ -263,6 +280,9 @@ def poll_posts():
         return f"Error: {e}", 500
 
 
+# ============================================
+# GET POST STATS FROM FACEBOOK
+# ============================================
 def get_post_stats(post_id):
     try:
         url = (
@@ -279,47 +299,18 @@ def get_post_stats(post_id):
         return 0, 0, 0
 
 
-def get_hq_image_url(attachments, post_id):
-    try:
-        for attachment in attachments:
-            media = attachment.get("media", {})
-            image = media.get("image", {})
-            src   = image.get("src", "")
-            if src:
-                return src
-        return get_post_image_url_hq(post_id)
-    except:
-        return get_post_image_url_hq(post_id)
-
-
-def get_post_image_url_hq(post_id):
-    try:
-        url    = (
-            f"https://graph.facebook.com/{post_id}"
-            f"?fields=attachments{{media{{image{{src,width,height}}}}}}"
-            f"&access_token={FB_PAGE_TOKEN}"
-        )
-        result      = requests.get(url).json()
-        attachments = result.get("attachments", {}).get("data", [])
-        for attachment in attachments:
-            media = attachment.get("media", {})
-            image = media.get("image", {})
-            src   = image.get("src", "")
-            if src:
-                return src
-        url2    = f"https://graph.facebook.com/{post_id}?fields=full_picture&access_token={FB_PAGE_TOKEN}"
-        result2 = requests.get(url2).json()
-        return result2.get("full_picture", "")
-    except:
-        return ""
-
-
+# ============================================
+# NOTIFY ADMIN ON TELEGRAM
+# ============================================
 def notify(text):
     if not ADMIN_CHAT_ID:
         return
     send_message(ADMIN_CHAT_ID, text)
 
 
+# ============================================
+# THREADS SETUP PAGE
+# ============================================
 @app.route("/threads-setup")
 def threads_setup():
     auth_url = (
@@ -332,6 +323,9 @@ def threads_setup():
     return redirect(auth_url)
 
 
+# ============================================
+# THREADS CALLBACK
+# ============================================
 @app.route("/threads-callback")
 def threads_callback():
     code = request.args.get("code")
@@ -365,6 +359,9 @@ def threads_callback():
     """
 
 
+# ============================================
+# TELEGRAM WEBHOOK
+# ============================================
 @app.route("/webhook", methods=["POST"])
 def webhook():
     update = request.get_json()
@@ -401,6 +398,9 @@ def webhook():
     return jsonify({"ok": True})
 
 
+# ============================================
+# HANDLE BUTTON CLICKS
+# ============================================
 def handle_callback(callback):
     chat_id     = callback["message"]["chat"]["id"]
     data        = callback["data"]
@@ -432,6 +432,9 @@ def handle_callback(callback):
         )
 
 
+# ============================================
+# SAVE TO SHEET1 (manual input via Telegram)
+# ============================================
 def save_to_sheet(message_id, c2, likes, reached):
     try:
         gc    = get_sheets_client()
@@ -440,7 +443,7 @@ def save_to_sheet(message_id, c2, likes, reached):
         if len(rows) == 0:
             sheet.append_row([
                 "Message ID", "Date & Time Added", "C2 Text",
-                "Reactions", "Comments", "Shares", "Image URL"
+                "Reactions", "Comments", "Shares", "Post Link"
             ])
             rows = sheet.get_all_values()
         for row in rows[1:]:
