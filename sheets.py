@@ -5,11 +5,6 @@ from google.oauth2.service_account import Credentials
 from config import SHEET_ID, SHEET_NAME, TESTING_SHEET
 
 
-# ============================================
-# GOOGLE CREDENTIALS
-# Authenticates using service account from
-# GOOGLE_CREDS environment variable.
-# ============================================
 def get_google_creds():
     creds_json = os.environ.get("GOOGLE_CREDS")
     creds_dict = json.loads(creds_json)
@@ -21,10 +16,6 @@ def get_sheets_client():
     return gspread.authorize(get_google_creds())
 
 
-# ============================================
-# GET BOTH WORKSHEETS
-# Returns testing C2 sheet and Sheet1.
-# ============================================
 def get_worksheets():
     gc     = get_sheets_client()
     wb     = gc.open_by_key(SHEET_ID)
@@ -33,10 +24,6 @@ def get_worksheets():
     return sheet, sheet1
 
 
-# ============================================
-# ENSURE HEADERS EXIST
-# Creates header row if sheet is empty.
-# ============================================
 def ensure_testing_headers(sheet):
     rows = sheet.get_all_values()
     if len(rows) == 0:
@@ -57,10 +44,6 @@ def ensure_sheet1_headers(sheet1):
     return sheet1.get_all_values()
 
 
-# ============================================
-# GET ALL IDS FROM A SHEET
-# Returns a set of all IDs in column 1.
-# ============================================
 def get_all_ids(rows):
     ids = set()
     for row in rows[1:]:
@@ -69,10 +52,6 @@ def get_all_ids(rows):
     return ids
 
 
-# ============================================
-# SAVE POST TO TESTING C2
-# Appends a new row with post data.
-# ============================================
 def save_to_testing(sheet, post_id, formatted_date, c2_text, reactions, comments, shares, post_link):
     sheet.append_row([
         post_id, formatted_date, c2_text,
@@ -80,10 +59,6 @@ def save_to_testing(sheet, post_id, formatted_date, c2_text, reactions, comments
     ])
 
 
-# ============================================
-# SAVE WINNER TO SHEET1
-# Appends a winning post to the A-RR database.
-# ============================================
 def save_to_sheet1(sheet1, post_id, posted_at, c2_text, reactions, comments, shares, post_link):
     sheet1.append_row([
         post_id, posted_at, c2_text,
@@ -91,29 +66,23 @@ def save_to_sheet1(sheet1, post_id, posted_at, c2_text, reactions, comments, sha
     ])
 
 
-# ============================================
-# UPDATE POST STATS IN A SHEET
-# Updates reactions, comments, shares for a row.
-# ============================================
-def update_stats(sheet, row_index, reactions, comments, shares):
-    sheet.update_cell(row_index, 4, f"{reactions:,}")
-    sheet.update_cell(row_index, 5, f"{comments:,}")
-    sheet.update_cell(row_index, 6, f"{shares:,}")
+def batch_update_stats(sheet, updates):
+    if not updates:
+        return
+    # updates = list of (row_index, reactions, comments, shares)
+    # Use batch update to reduce API calls
+    cell_list = []
+    for row_index, reactions, comments, shares in updates:
+        cell_list.append(gspread.Cell(row_index, 4, f"{reactions:,}"))
+        cell_list.append(gspread.Cell(row_index, 5, f"{comments:,}"))
+        cell_list.append(gspread.Cell(row_index, 6, f"{shares:,}"))
+    sheet.update_cells(cell_list)
 
 
-# ============================================
-# UPDATE POST LINK IN A SHEET
-# Updates the Post Link column for a row.
-# ============================================
 def update_post_link(sheet, row_index, post_link):
     sheet.update_cell(row_index, 7, post_link)
 
 
-# ============================================
-# DELETE ROWS BY POST IDS
-# Reads sheet fresh then deletes matching rows
-# from bottom up to preserve row numbers.
-# ============================================
 def delete_rows_by_ids(sheet, ids_to_delete):
     if not ids_to_delete:
         return
@@ -126,10 +95,6 @@ def delete_rows_by_ids(sheet, ids_to_delete):
         sheet.delete_rows(row_num)
 
 
-# ============================================
-# SAVE MANUAL INPUT TO SHEET1
-# Used when user sends C2 via Telegram bot.
-# ============================================
 def save_manual_input(message_id, date_time, c2, likes):
     gc    = get_sheets_client()
     sheet = gc.open_by_key(SHEET_ID).worksheet(SHEET_NAME)
@@ -142,12 +107,10 @@ def save_manual_input(message_id, date_time, c2, likes):
         ])
         rows = sheet.get_all_values()
 
-    # Check duplicates by message ID
     for row in rows[1:]:
         if str(row[0]).strip() == message_id:
             return "duplicate"
 
-    # Check duplicates by C2 text and likes
     for row in rows[1:]:
         if str(row[2]).strip() == c2 and str(row[3]).strip() == likes:
             return "duplicate"
