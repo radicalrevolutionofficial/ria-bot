@@ -177,6 +177,16 @@ def threads_callback():
     """
 
 
+
+
+@app.route("/check-schedule", methods=["GET"])
+def check_schedule():
+    try:
+        from scheduler import check_scheduled_posts
+        count = check_scheduled_posts()
+        return f"Schedule check done! {count} posts found.", 200
+    except Exception as e:
+        return f"Error: {e}", 500
 if __name__ == "__main__":
     port = int(os.environ.get("PORT", 10000))
     app.run(host="0.0.0.0", port=port)
@@ -185,12 +195,3 @@ if __name__ == "__main__":
 # MORNING SCHEDULE CHECK
 # Called by cron-job.org every morning at 7AM.
 # Checks FB scheduled posts for next 3 days.
-# ============================================
-@app.route("/check-schedule", methods=["GET"])
-def check_schedule():
-    try:
-        from scheduler import check_scheduled_posts
-        count = check_scheduled_posts()
-        return f"Schedule check done! {count} posts found in next 3 days.", 200
-    except Exception as e:
-        return f"Error: {e}", 500
